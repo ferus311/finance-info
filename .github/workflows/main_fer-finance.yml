@@ -37,6 +37,7 @@ jobs:
                   cp -r .next/standalone/* deploy/
                   cp -r .next/static deploy/.next/static
                   if [ -d public ]; then cp -r public deploy/public; fi
+                  node -e "const fs=require('fs');const p='deploy/package.json';const j=JSON.parse(fs.readFileSync(p,'utf8'));j.scripts={...(j.scripts||{}),start:'node server.js'};fs.writeFileSync(p,JSON.stringify(j,null,2));"
 
             - name: Upload artifact for deployment job
               uses: actions/upload-artifact@v4
@@ -58,12 +59,29 @@ jobs:
                   name: node-app
                   path: deploy
 
+            - name: Verify deploy package
+              run: |
+                  ls -la deploy
+                  test -f deploy/server.js
+
             - name: Login to Azure
               uses: azure/login@v2
               with:
                   client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_BDC67B2ADDB44273BE064ECDB1CAFD55 }}
                   tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_22F5D4DDBC0240A5976B3119C089B0F0 }}
                   subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_27CF9F41D0F94632A724B0D848A32957 }}
+
+            - name: Resolve resource group
+              id: resolve-rg
+              uses: azure/cli@v2
+              with:
+                  inlineScript: |
+                      RG=$(az resource list --name fer-finance --resource-type "Microsoft.Web/sites" --query "[0].resourceGroup" -o tsv)
+                      if [ -z "$RG" ]; then
+                        echo "Resource group for Web App fer-finance was not found."
+                        exit 1
+                      fi
+                      echo "resourceGroup=$RG" >> "$GITHUB_OUTPUT"
 
             - name: 'Deploy to Azure Web App'
               id: deploy-to-webapp
@@ -72,3 +90,13 @@ jobs:
                   app-name: 'fer-finance'
                   slot-name: 'Production'
                   package: ./deploy
+                  startup-command: 'node server.js'
+
+            - name: Enforce startup command on App Service
+              uses: azure/cli@v2
+              with:
+                  inlineScript: |
+                      az webapp config set \
+                        --resource-group "${{ steps.resolve-rg.outputs.resourceGroup }}" \
+                        --name "fer-finance" \
+                        --startup-file "node server.js"
