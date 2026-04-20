@@ -6,9 +6,16 @@ on:
             - main
     workflow_dispatch:
 
+concurrency:
+    group: fer-finance-production
+    cancel-in-progress: true
+
 jobs:
     deploy:
         runs-on: ubuntu-latest
+        timeout-minutes: 30
+        environment:
+            name: Production
         permissions:
             id-token: write
             contents: read
@@ -32,6 +39,30 @@ jobs:
               run: npm run build
               env:
                   NEXT_PUBLIC_API_URL: ${{ secrets.NEXT_PUBLIC_API_URL }}
+
+            - name: Prepare deployment package
+              run: |
+                  tar -czf release.tgz \
+                    .next \
+                    public \
+                    package.json \
+                    package-lock.json \
+                    next.config.ts
+
+            - name: Upload build artifact
+              uses: actions/upload-artifact@v4
+              with:
+                  name: nextjs-app
+                  path: release.tgz
+                  if-no-files-found: error
+
+            - name: Download build artifact
+              uses: actions/download-artifact@v4
+              with:
+                  name: nextjs-app
+
+            - name: Extract deployment package
+              run: tar -xzf release.tgz
 
             - name: Login to Azure
               uses: azure/login@v2

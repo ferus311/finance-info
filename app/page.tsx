@@ -9,24 +9,33 @@ import { loadWatchlist, saveWatchlist } from "./lib/storage";
 import type { MarketResponse, MarketRow } from "./types/market";
 
 const POLL_INTERVAL = 10000;
+const DEFAULT_CRYPTO_SYMBOLS = ["BTCUSDT", "SOLUSDT", "ETHUSDT", "ARBUSDT"];
+const DEFAULT_STOCK_SYMBOLS = ["SSI", "GAS"];
 
 export default function Home() {
     const [messageApi, contextHolder] = message.useMessage();
-    const [cryptoSymbols, setCryptoSymbols] = useState<string[]>([
-        "BTCUSDT",
-        "SOLUSDT",
-        "ETHUSDT",
-        "ARBUSDT",
-    ]);
-    const [stockSymbols, setStockSymbols] = useState<string[]>(["SSI", "GAS"]);
+    const [persisted] = useState(() => {
+        if (typeof window === "undefined") {
+            return { cryptoSymbols: [], stockSymbols: [], vnDate: null as string | null };
+        }
+
+        return loadWatchlist();
+    });
+    const [cryptoSymbols, setCryptoSymbols] = useState<string[]>(() =>
+        persisted.cryptoSymbols.length > 0 ? persisted.cryptoSymbols : DEFAULT_CRYPTO_SYMBOLS,
+    );
+    const [stockSymbols, setStockSymbols] = useState<string[]>(() =>
+        persisted.stockSymbols.length > 0 ? persisted.stockSymbols : DEFAULT_STOCK_SYMBOLS,
+    );
     const [cryptoRows, setCryptoRows] = useState<MarketRow[]>([]);
     const [stockRows, setStockRows] = useState<MarketRow[]>([]);
     const [cryptoLoading, setCryptoLoading] = useState(true);
     const [stockLoading, setStockLoading] = useState(true);
     const [lastCryptoUpdated, setLastCryptoUpdated] = useState<string | null>(null);
     const [lastStockUpdated, setLastStockUpdated] = useState<string | null>(null);
-    const [isReady, setIsReady] = useState(false);
-    const [vnDate, setVnDate] = useState<string>(() => toDateInputValue(getNearestWeekday()));
+    const [vnDate, setVnDate] = useState<string>(() =>
+        persisted.vnDate ?? toDateInputValue(getNearestWeekday()),
+    );
     const [cryptoInput, setCryptoInput] = useState("");
     const [stockInput, setStockInput] = useState("");
 
@@ -73,41 +82,10 @@ export default function Home() {
     }, [stockSymbols, vnDate]);
 
     useEffect(() => {
-        try {
-            const { cryptoSymbols: savedCrypto, stockSymbols: savedStocks, vnDate: savedVnDate } =
-                loadWatchlist();
-
-            if (savedCrypto.length > 0) {
-                setCryptoSymbols(savedCrypto);
-            }
-
-            if (savedStocks.length > 0) {
-                setStockSymbols(savedStocks);
-            }
-
-            if (savedVnDate) {
-                setVnDate(savedVnDate);
-            }
-        } catch {
-            // Keep defaults if localStorage is unavailable.
-        } finally {
-            setIsReady(true);
-        }
-    }, []);
-
-    useEffect(() => {
-        if (!isReady) {
-            return;
-        }
-
         saveWatchlist(cryptoSymbols, stockSymbols, vnDate);
-    }, [cryptoSymbols, stockSymbols, vnDate, isReady]);
+    }, [cryptoSymbols, stockSymbols, vnDate]);
 
     useEffect(() => {
-        if (!isReady) {
-            return;
-        }
-
         let isMounted = true;
 
         const run = async (silent = false) => {
@@ -137,13 +115,9 @@ export default function Home() {
             isMounted = false;
             window.clearInterval(timer);
         };
-    }, [fetchCryptoQuotes, isReady, messageApi]);
+    }, [fetchCryptoQuotes, messageApi]);
 
     useEffect(() => {
-        if (!isReady) {
-            return;
-        }
-
         let isMounted = true;
 
         const run = async (silent = false) => {
@@ -173,7 +147,7 @@ export default function Home() {
             isMounted = false;
             window.clearInterval(timer);
         };
-    }, [fetchStockQuotes, isReady, messageApi]);
+    }, [fetchStockQuotes, messageApi]);
 
     const totalCrypto = useMemo(
         () => cryptoRows.filter((item) => item.status === "ok").length,
