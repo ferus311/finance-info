@@ -11,13 +11,10 @@ concurrency:
     cancel-in-progress: true
 
 jobs:
-    deploy:
+    build:
         runs-on: ubuntu-latest
-        timeout-minutes: 30
-        environment:
-            name: Production
+        timeout-minutes: 20
         permissions:
-            id-token: write
             contents: read
 
         steps:
@@ -56,26 +53,39 @@ jobs:
                   path: release.tgz
                   if-no-files-found: error
 
-            - name: Download build artifact
-              uses: actions/download-artifact@v4
-              with:
-                  name: nextjs-app
+        deploy:
+            runs-on: ubuntu-latest
+            needs: build
+            timeout-minutes: 20
+            environment:
+                name: Production
+            permissions:
+                id-token: write
+                contents: read
 
-            - name: Extract deployment package
-              run: tar -xzf release.tgz
+            steps:
+                - uses: actions/checkout@v4
 
-            - name: Login to Azure
-              uses: azure/login@v2
-              with:
-                  client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_BDC67B2ADDB44273BE064ECDB1CAFD55 }}
-                  tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_22F5D4DDBC0240A5976B3119C089B0F0 }}
-                  subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_27CF9F41D0F94632A724B0D848A32957 }}
+                - name: Download build artifact
+                  uses: actions/download-artifact@v4
+                  with:
+                      name: nextjs-app
 
-            - name: Deploy to Azure Web App
-              id: deploy-to-webapp
-              uses: azure/webapps-deploy@v3
-              with:
-                  app-name: 'fer-finance'
-                  slot-name: 'Production'
-                  package: .
-                  startup-command: 'npm start'
+                - name: Extract deployment package
+                  run: tar -xzf release.tgz
+
+                - name: Login to Azure
+                  uses: azure/login@v2
+                  with:
+                      client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_BDC67B2ADDB44273BE064ECDB1CAFD55 }}
+                      tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_22F5D4DDBC0240A5976B3119C089B0F0 }}
+                      subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_27CF9F41D0F94632A724B0D848A32957 }}
+
+                - name: Deploy to Azure Web App
+                  id: deploy-to-webapp
+                  uses: azure/webapps-deploy@v3
+                  with:
+                      app-name: 'fer-finance'
+                      slot-name: 'Production'
+                      package: .
+                      startup-command: 'npm start'
