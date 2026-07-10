@@ -1,8 +1,8 @@
 "use client";
 import React from 'react';
-import { LaptopOutlined, NotificationOutlined, UserOutlined } from '@ant-design/icons';
+import { LaptopOutlined, MenuFoldOutlined, MenuUnfoldOutlined, NotificationOutlined, UserOutlined } from '@ant-design/icons';
 import type { MenuProps } from 'antd';
-import { Layout, Menu, theme } from 'antd';
+import { Button, Layout, Menu, theme } from 'antd';
 import Link from 'next/link';
 import './layout.style.css';
 
@@ -55,12 +55,22 @@ const MainLayout: React.FC<MainLayoutProps> = ({ children }) => {
     const {
         token: { colorBgContainer, borderRadiusLG },
     } = theme.useToken();
+    const [collapsed, setCollapsed] = React.useState(false);
+
+    const siderTrigger = (
+        <Button
+            type="text"
+            aria-label={collapsed ? 'Open sidebar' : 'Close sidebar'}
+            icon={collapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
+            className="dashboard-sider-trigger"
+        />
+    );
 
     return (
         <Layout className="h-full flex flex-col overflow-hidden">
-            <Header className="bg-white" style={{ display: 'flex', padding: 0, backgroundColor: colorBgContainer }}>
+            <Header className="bg-white" style={{ display: 'flex', padding: 0, backgroundColor: colorBgContainer, alignItems: 'center' }}>
                 <div className="demo-logo flex items-center justify-center w-[200px] " >
-                    <img src="/assets/images/logo.png" alt="Logo" style={{ height: '80%' }} />
+                    <img src="/assets/images/logo.png" alt="Logo" style={{ width: '100%', height: '100%', objectFit: 'contain' }} />
                 </div>
                 <Menu
                     theme="light"
@@ -71,7 +81,16 @@ const MainLayout: React.FC<MainLayoutProps> = ({ children }) => {
                 />
             </Header>
             <Layout className="flex flex-1 min-h-0 overflow-hidden">
-                <Sider width={200} style={{ background: colorBgContainer, overflow: 'auto' }}>
+                <Sider
+                    width={200}
+                    breakpoint="lg"
+                    collapsedWidth={0}
+                    collapsible
+                    collapsed={collapsed}
+                    onCollapse={setCollapsed}
+                    trigger={siderTrigger}
+                    style={{ background: colorBgContainer, overflow: 'auto' }}
+                >
                     <Menu
                         mode="inline"
                         defaultSelectedKeys={['1']}

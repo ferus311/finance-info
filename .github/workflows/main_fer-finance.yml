@@ -1,89 +1,89 @@
-name: Build and deploy Next.js app to Azure Web App - fer-finance
+# name: Build and deploy Next.js app to Azure Web App - fer-finance
 
-on:
-    push:
-        branches:
-            - main
-    workflow_dispatch:
+# on:
+#     push:
+#         branches:
+#             - main
+#     workflow_dispatch:
 
-concurrency:
-    group: fer-finance-production
-    cancel-in-progress: true
+# concurrency:
+#     group: fer-finance-production
+#     cancel-in-progress: true
 
-jobs:
-    build:
-        runs-on: ubuntu-latest
-        timeout-minutes: 20
-        permissions:
-            contents: read
+# jobs:
+#     build:
+#         runs-on: ubuntu-latest
+#         timeout-minutes: 20
+#         permissions:
+#             contents: read
 
-        steps:
-            - uses: actions/checkout@v4
+#         steps:
+#             - uses: actions/checkout@v4
 
-            - name: Set up Node.js version
-              uses: actions/setup-node@v4
-              with:
-                  node-version: '22.x'
-                  cache: 'npm'
+#             - name: Set up Node.js version
+#               uses: actions/setup-node@v4
+#               with:
+#                   node-version: '22.x'
+#                   cache: 'npm'
 
-            - name: Install dependencies
-              run: npm ci
+#             - name: Install dependencies
+#               run: npm ci
 
-            - name: Lint
-              run: npm run lint
+#             - name: Lint
+#               run: npm run lint
 
-            - name: Build project
-              run: npm run build
-              env:
-                  NEXT_PUBLIC_API_URL: ${{ secrets.NEXT_PUBLIC_API_URL }}
+#             - name: Build project
+#               run: npm run build
+#               env:
+#                   NEXT_PUBLIC_API_URL: ${{ secrets.NEXT_PUBLIC_API_URL }}
 
-            - name: Prepare deployment package
-              run: |
-                  tar -czf release.tgz \
-                    .next \
-                    public \
-                    package.json \
-                    package-lock.json \
-                    next.config.ts
+#             - name: Prepare deployment package
+#               run: |
+#                   tar -czf release.tgz \
+#                     .next \
+#                     public \
+#                     package.json \
+#                     package-lock.json \
+#                     next.config.ts
 
-            - name: Upload build artifact
-              uses: actions/upload-artifact@v4
-              with:
-                  name: nextjs-app
-                  path: release.tgz
-                  if-no-files-found: error
+#             - name: Upload build artifact
+#               uses: actions/upload-artifact@v4
+#               with:
+#                   name: nextjs-app
+#                   path: release.tgz
+#                   if-no-files-found: error
 
-    deploy:
-        runs-on: ubuntu-latest
-        needs: build
-        timeout-minutes: 20
-        permissions:
-            id-token: write
-            contents: read
+#     deploy:
+#         runs-on: ubuntu-latest
+#         needs: build
+#         timeout-minutes: 20
+#         permissions:
+#             id-token: write
+#             contents: read
 
-        steps:
-            - uses: actions/checkout@v4
+#         steps:
+#             - uses: actions/checkout@v4
 
-            - name: Download build artifact
-              uses: actions/download-artifact@v4
-              with:
-                  name: nextjs-app
+#             - name: Download build artifact
+#               uses: actions/download-artifact@v4
+#               with:
+#                   name: nextjs-app
 
-            - name: Extract deployment package
-              run: tar -xzf release.tgz
+#             - name: Extract deployment package
+#               run: tar -xzf release.tgz
 
-            - name: Login to Azure
-              uses: azure/login@v2
-              with:
-                  client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_BDC67B2ADDB44273BE064ECDB1CAFD55 }}
-                  tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_22F5D4DDBC0240A5976B3119C089B0F0 }}
-                  subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_27CF9F41D0F94632A724B0D848A32957 }}
+#             - name: Login to Azure
+#               uses: azure/login@v2
+#               with:
+#                   client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_BDC67B2ADDB44273BE064ECDB1CAFD55 }}
+#                   tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_22F5D4DDBC0240A5976B3119C089B0F0 }}
+#                   subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_27CF9F41D0F94632A724B0D848A32957 }}
 
-            - name: Deploy to Azure Web App
-              id: deploy-to-webapp
-              uses: azure/webapps-deploy@v3
-              with:
-                  app-name: 'fer-finance'
-                  slot-name: 'Production'
-                  package: .
-                  startup-command: 'npm start'
+#             - name: Deploy to Azure Web App
+#               id: deploy-to-webapp
+#               uses: azure/webapps-deploy@v3
+#               with:
+#                   app-name: 'fer-finance'
+#                   slot-name: 'Production'
+#                   package: .
+#                   startup-command: 'npm start'
