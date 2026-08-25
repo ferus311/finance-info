@@ -12,50 +12,69 @@ type MarketSectionProps = {
     onInputChange: (nextValue: string) => void;
     onAddSymbol: (value: string) => void;
     onRemoveSymbol: (symbol: string) => void;
+    detailsLinkForSymbol?: (symbol: string) => string;
     dateValue?: string;
     onDateChange?: (value: string) => void;
 };
 
-const columns: TableProps<MarketRow>["columns"] = [
-    {
-        title: "Symbol",
-        dataIndex: "symbol",
-        key: "symbol",
-        render: (value: string) => <Tag color="blue">{value}</Tag>,
-    },
-    {
-        title: "Price",
-        dataIndex: "price",
-        key: "price",
-        render: (value: number | null, row: MarketRow) =>
-            value === null ? "N/A" : `${value.toLocaleString()} ${row.currency}`,
-    },
-    {
-        title: "Change %",
-        dataIndex: "changePercent",
-        key: "changePercent",
-        render: (value: number | null) => {
-            if (value === null) {
-                return "N/A";
-            }
+function getColumns(
+    detailsLinkForSymbol?: (symbol: string) => string,
+): TableProps<MarketRow>["columns"] {
+    return [
+        {
+            title: "Symbol",
+            dataIndex: "symbol",
+            key: "symbol",
+            render: (value: string) => {
+                const detailsUrl = detailsLinkForSymbol?.(value);
+                const symbol = <Tag color="blue">{value}</Tag>;
 
-            const color = value >= 0 ? "green" : "red";
-            return <Tag color={color}>{value.toFixed(2)}%</Tag>;
+                return detailsUrl ? (
+                    <a
+                        href={detailsUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        title={`Open detailed chart for ${value}`}
+                    >
+                        {symbol}
+                    </a>
+                ) : symbol;
+            },
         },
-    },
-    {
-        title: "Status",
-        dataIndex: "status",
-        key: "status",
-        render: (value: MarketRow["status"]) =>
-            value === "ok" ? <Tag color="success">OK</Tag> : <Tag>Unavailable</Tag>,
-    },
-    {
-        title: "Source",
-        dataIndex: "source",
-        key: "source",
-    },
-];
+        {
+            title: "Price",
+            dataIndex: "price",
+            key: "price",
+            render: (value: number | null, row: MarketRow) =>
+                value === null ? "N/A" : `${value.toLocaleString()} ${row.currency}`,
+        },
+        {
+            title: "Change %",
+            dataIndex: "changePercent",
+            key: "changePercent",
+            render: (value: number | null) => {
+                if (value === null) {
+                    return "N/A";
+                }
+
+                const color = value >= 0 ? "green" : "red";
+                return <Tag color={color}>{value.toFixed(2)}%</Tag>;
+            },
+        },
+        {
+            title: "Status",
+            dataIndex: "status",
+            key: "status",
+            render: (value: MarketRow["status"]) =>
+                value === "ok" ? <Tag color="success">OK</Tag> : <Tag>Unavailable</Tag>,
+        },
+        {
+            title: "Source",
+            dataIndex: "source",
+            key: "source",
+        },
+    ];
+}
 
 export function MarketSection({
     title,
@@ -67,6 +86,7 @@ export function MarketSection({
     onInputChange,
     onAddSymbol,
     onRemoveSymbol,
+    detailsLinkForSymbol,
     dateValue,
     onDateChange,
 }: MarketSectionProps) {
@@ -96,7 +116,7 @@ export function MarketSection({
                 </Space>
                 <Table<MarketRow>
                     rowKey="symbol"
-                    columns={columns}
+                    columns={getColumns(detailsLinkForSymbol)}
                     dataSource={rows}
                     pagination={false}
                     size="small"

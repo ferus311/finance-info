@@ -3,7 +3,7 @@ import { redirect } from 'next/navigation';
 
 const Home = () => {
     // redirect to /dashboard/newsfeed
-    redirect('/dashboard');
+    redirect('/dashboard/stocks');
 }
 
 export default Home;

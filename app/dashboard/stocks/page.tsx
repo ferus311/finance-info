@@ -34,7 +34,7 @@ export default function StocksPage() {
     const [lastCryptoUpdated, setLastCryptoUpdated] = useState<string | null>(null);
     const [lastStockUpdated, setLastStockUpdated] = useState<string | null>(null);
     const [vnDate, setVnDate] = useState<string>(() =>
-        persisted.vnDate ?? toDateInputValue(getNearestWeekday()),
+        toDateInputValue(getNearestWeekday()),
     );
     const [cryptoInput, setCryptoInput] = useState("");
     const [stockInput, setStockInput] = useState("");
@@ -231,6 +231,9 @@ export default function StocksPage() {
                                 }
                                 onRemoveSymbol={(symbol) =>
                                     removeSymbol(symbol, cryptoSymbols, setCryptoSymbols)
+                                }
+                                detailsLinkForSymbol={(symbol) =>
+                                    `https://www.tradingview.com/chart/?symbol=BINANCE%3A${encodeURIComponent(symbol)}`
                                 }
                             />
 

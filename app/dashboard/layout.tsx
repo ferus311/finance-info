@@ -5,6 +5,7 @@ import type { MenuProps } from 'antd';
 import { Button, Layout, Menu, theme } from 'antd';
 import Link from 'next/link';
 import './layout.style.css';
+import { usePathname } from 'next/navigation';
 
 const { Header, Content, Sider } = Layout;
 
@@ -51,31 +52,27 @@ const items2: MenuProps['items'] = [UserOutlined, LaptopOutlined, NotificationOu
     },
 );
 
+
+
 const MainLayout: React.FC<MainLayoutProps> = ({ children }) => {
     const {
         token: { colorBgContainer, borderRadiusLG },
     } = theme.useToken();
-    const [collapsed, setCollapsed] = React.useState(false);
-
-    const siderTrigger = (
-        <Button
-            type="text"
-            aria-label={collapsed ? 'Open sidebar' : 'Close sidebar'}
-            icon={collapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
-            className="dashboard-sider-trigger"
-        />
-    );
+    const [collapsed, setCollapsed] = React.useState(true);
+    const pathName = usePathname();
 
     return (
         <Layout className="h-full flex flex-col overflow-hidden">
             <Header className="bg-white" style={{ display: 'flex', padding: 0, backgroundColor: colorBgContainer, alignItems: 'center' }}>
                 <div className="demo-logo flex items-center justify-center w-[200px] " >
-                    <img src="/assets/images/logo.png" alt="Logo" style={{ width: '100%', height: '100%', objectFit: 'contain' }} />
+                    <Link href="/dashboard/stocks" className="flex items-center justify-center w-full h-full">
+                        <img src="/assets/images/logo.png" alt="Logo" style={{ width: '50%', height: '100%', objectFit: 'contain' }} />
+                    </Link>
                 </div>
                 <Menu
                     theme="light"
-                    // mode="horizontal"
-                    defaultSelectedKeys={['2']}
+                    // defaultSelectedKeys={}
+                    selectedKeys={[pathName]}
                     items={headerNavItems}
                     className="flex-1 flex justify-around [&>li.ant-menu-item-only-child]:(flex-1 flex justify-center items-center) "
                 />
@@ -84,17 +81,17 @@ const MainLayout: React.FC<MainLayoutProps> = ({ children }) => {
                 <Sider
                     width={200}
                     breakpoint="lg"
-                    collapsedWidth={0}
+                    // collapsedWidth={0}
                     collapsible
                     collapsed={collapsed}
-                    onCollapse={setCollapsed}
-                    trigger={siderTrigger}
+                    onCollapse={(value) => setCollapsed(value)}
                     style={{ background: colorBgContainer, overflow: 'auto' }}
                 >
                     <Menu
                         mode="inline"
-                        defaultSelectedKeys={['1']}
-                        defaultOpenKeys={['sub1']}
+                        // defaultSelectedKeys={['1']}
+                        // defaultOpenKeys={['sub1']}
+                        theme="light"
                         style={{ height: '100%', borderInlineEnd: 0 }}
                         items={items2}
                     />
@@ -104,7 +101,7 @@ const MainLayout: React.FC<MainLayoutProps> = ({ children }) => {
                         style={{
                             flex: 1,
                             minHeight: 0,
-                            padding: 24,
+                            // padding: 24,
                             margin: 0,
                             background: colorBgContainer,
                             borderRadius: borderRadiusLG,
