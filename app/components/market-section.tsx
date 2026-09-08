@@ -92,7 +92,7 @@ export function MarketSection({
 }: MarketSectionProps) {
     return (
         <Card title={title} loading={loading} className="dashboard-card">
-            <Space direction="vertical" style={{ width: "100%" }} size={12}>
+            <Space orientation="vertical" style={{ width: "100%" }} size={12}>
                 {onDateChange ? (
                     <Input
                         type="date"

@@ -172,14 +172,17 @@ async function fetchVietnamStockQuotes(
       }
 
       const basicPrice = latestTrade.basicPrice;
+      const priceInVnd = latestTrade.price * 1000;
+      const basicPriceInVnd =
+        typeof basicPrice === "number" ? basicPrice * 1000 : null;
       const changePercent =
-        typeof basicPrice === "number" && basicPrice > 0
-          ? ((latestTrade.price - basicPrice) / basicPrice) * 100
+        basicPriceInVnd !== null && basicPriceInVnd > 0
+          ? ((priceInVnd - basicPriceInVnd) / basicPriceInVnd) * 100
           : null;
 
       return {
         symbol: latestTrade.symbol ?? symbol,
-        price: latestTrade.price,
+        price: priceInVnd,
         currency: "VND",
         changePercent,
         source: "CafeF",

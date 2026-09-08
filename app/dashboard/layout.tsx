@@ -5,7 +5,7 @@ import type { MenuProps } from 'antd';
 import { Button, Layout, Menu, theme } from 'antd';
 import Link from 'next/link';
 import './layout.style.css';
-import { usePathname } from 'next/navigation';
+import { usePathname, useRouter } from 'next/navigation';
 
 const { Header, Content, Sider } = Layout;
 
@@ -17,7 +17,7 @@ const headerNavItems: MenuProps['items'] = [
     },
     {
         key: '/dashboard/crypto',
-        label: <Link href="/dashboard/crypto">Crypto</Link>,
+        label: <Link href="/dashboard/trade">Trade Test</Link>,
     },
     {
         key: '/dashboard/stocks',
@@ -59,7 +59,29 @@ const MainLayout: React.FC<MainLayoutProps> = ({ children }) => {
         token: { colorBgContainer, borderRadiusLG },
     } = theme.useToken();
     const [collapsed, setCollapsed] = React.useState(true);
+    const [checkingAuth, setCheckingAuth] = React.useState(true);
     const pathName = usePathname();
+    const router = useRouter();
+
+    React.useEffect(() => {
+        fetch('/api/auth/me', { cache: 'no-store' })
+            .then((response) => response.json())
+            .then(({ user }) => {
+                if (!user) router.replace('/login');
+            })
+            .catch(() => router.replace('/login'))
+            .finally(() => setCheckingAuth(false));
+    }, [router]);
+
+    const logout = async () => {
+        await fetch('/api/auth/logout', { method: 'POST' });
+        router.replace('/login');
+        router.refresh();
+    };
+
+    if (checkingAuth) {
+        return <div style={{ minHeight: '100vh', display: 'grid', placeItems: 'center' }}>Loading...</div>;
+    }
 
     return (
         <Layout className="h-full flex flex-col overflow-hidden">
@@ -76,6 +98,7 @@ const MainLayout: React.FC<MainLayoutProps> = ({ children }) => {
                     items={headerNavItems}
                     className="flex-1 flex justify-around [&>li.ant-menu-item-only-child]:(flex-1 flex justify-center items-center) "
                 />
+                <Button type="text" onClick={() => void logout()} style={{ marginRight: 16 }}>Đăng xuất</Button>
             </Header>
             <Layout className="flex flex-1 min-h-0 overflow-hidden">
                 <Sider

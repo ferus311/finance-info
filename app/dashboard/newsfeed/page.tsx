@@ -5,42 +5,36 @@ type SourceGroup = { number: string; title: string; summary: string; sources: So
 
 const groups: SourceGroup[] = [
     {
-        number: "01", title: "Tin nhanh thị trường",
-        summary: "Headline về vĩ mô, chứng khoán, crypto và thông cáo mới nhất.",
+        number: "01", title: "Tài chính & Vĩ mô",
+        summary: "Chính sách tiền tệ, thị trường chứng khoán và dữ liệu kinh tế (EN, JP, VN).",
         sources: [
-            { name: "Tree News", handle: "@Tree_News", description: "Newsfeed tự động, tốc độ cao cho tin tài chính và crypto.", url: "https://x.com/Tree_News" },
-            { name: "DB", handle: "@tier10k", description: "Tin breaking và thông cáo được tổng hợp nhanh trên X.", url: "https://x.com/tier10k" },
-            { name: "Walter Bloomberg", handle: "@DeItaone", description: "Tóm tắt tin vĩ mô, chứng khoán và phát biểu chính sách.", url: "https://x.com/DeItaone" },
+            { name: "Bloomberg", description: "Tốc độ nhanh, trung lập tuyệt đối về thị trường toàn cầu.", url: "https://www.bloomberg.com/markets" },
+            { name: "Financial Times", handle: "FT", description: "Phân tích sâu, giải mã chính sách vĩ mô.", url: "https://www.ft.com/markets" },
+            { name: "Nikkei", handle: "日本経済新聞", description: "Kim chỉ nam cho kinh tế và chính sách Nhật Bản.", url: "https://www.nikkei.com/" },
+            { name: "Yahoo! Finance JP", description: "Tin vắn nhanh và biến động giá nội địa Nhật.", url: "https://finance.yahoo.co.jp/" },
+            { name: "VnEconomy", description: "Chuẩn xác về số liệu vĩ mô và kinh tế Việt Nam.", url: "https://vneconomy.vn/" },
         ],
     },
     {
-        number: "02", title: "On-chain & sentiment",
-        summary: "Theo dõi dòng tiền, phái sinh, thanh lý và tâm lý thị trường crypto.",
+        number: "02", title: "Chiến sự & Địa chính trị",
+        summary: "Cập nhật xung đột quốc tế, fact-check tình báo và phân tích chiến lược.",
         sources: [
-            { name: "CoinGlass", description: "Long/Short, liquidation map, ETF flow và funding rate.", url: "https://www.coinglass.com/" },
-            { name: "CryptoQuant", description: "Dòng tiền nạp/rút sàn và dữ liệu on-chain chuyên sâu.", url: "https://cryptoquant.com/" },
-            { name: "Santiment", description: "Social volume, sentiment và hoạt động của mạng lưới.", url: "https://app.santiment.net/" },
-            { name: "The Block Data", description: "Tin crypto kết hợp biểu đồ và dashboard dữ liệu.", url: "https://www.theblock.co/data" },
-            { name: "CoinDesk Data", description: "Market data, chỉ số và phân tích trực quan.", url: "https://www.coindesk.com/data/" },
+            { name: "ISW", handle: "@TheStudyofWar", description: "Phân tích chiến thuật quân sự hàng ngày chi tiết và sát thực tế nhất.", url: "https://www.understandingwar.org/" },
+            { name: "AP News", description: "Đưa tin chiến sự, fact-check tốt nhất và không cảm xúc.", url: "https://apnews.com/" },
+            { name: "NHK News", handle: "NHKニュース", description: "Đưa tin nhanh, khách quan từ góc nhìn Nhật Bản.", url: "https://www3.nhk.or.jp/news/" },
+            { name: "Yomiuri Shimbun", handle: "読売新聞", description: "Góc nhìn chính trị quốc tế và ngoại giao sâu sắc.", url: "https://www.yomiuri.co.jp/" },
+            { name: "Nghiên cứu Quốc tế", description: "Bài dịch hàn lâm, phân tích chiến lược địa chính trị.", url: "https://nghiencuuquocte.org/" },
         ],
     },
     {
-        number: "03", title: "Macro & fundamental",
-        summary: "Nguồn báo chí để hiểu chính sách, dòng tiền toàn cầu và địa chính trị.",
+        number: "03", title: "Tiền ảo (Crypto & On-chain)",
+        summary: "Dữ liệu dòng tiền, hệ sinh thái và hành lang pháp lý crypto.",
         sources: [
-            { name: "Bloomberg", description: "Tin kinh tế, chính trị và thị trường toàn cầu.", url: "https://www.bloomberg.com/markets" },
-            { name: "Reuters", description: "Tin tức tài chính và kinh tế quốc tế đáng tin cậy.", url: "https://www.reuters.com/markets/" },
-            { name: "Financial Times", handle: "FT", description: "Phân tích chính sách tiền tệ và xu hướng vĩ mô dài hạn.", url: "https://www.ft.com/markets" },
-        ],
-    },
-    {
-        number: "04", title: "Nguồn tài chính Nhật Bản",
-        summary: "Góc nhìn địa phương về BoJ, USD/JPY, chứng khoán và tài sản số.",
-        sources: [
-            { name: "Nikkei", handle: "日本経済新聞", description: "Kinh tế Nhật, tỷ giá, chính sách và thị trường châu Á.", url: "https://www.nikkei.com/" },
-            { name: "CoinPost", description: "Tin crypto Nhật và hành lang pháp lý của FSA.", url: "https://coinpost.jp/" },
-            { name: "Minkabu", handle: "みんかぶ", description: "Dòng tiền, tâm lý nhà đầu tư và thông tin cổ phiếu.", url: "https://minkabu.jp/" },
-            { name: "Kabutan", handle: "株探", description: "Tin cổ phiếu, kết quả kinh doanh và biến động thị trường.", url: "https://kabutan.jp/" },
+            { name: "The Block", description: "Phân tích on-chain, dữ liệu dòng tiền và tin tức thị trường.", url: "https://www.theblock.co/" },
+            { name: "CoinDesk", description: "Tin tức thị trường chung, chỉ số và xu hướng vĩ mô crypto.", url: "https://www.coindesk.com/" },
+            { name: "CoinPost", handle: "コインポスト", description: "Trang tin Crypto lớn và uy tín nhất tại Nhật Bản.", url: "https://coinpost.jp/" },
+            { name: "Bitbank Blog", description: "Phân tích kỹ thuật chuyên sâu và xu hướng thị trường nội địa Nhật.", url: "https://blog.bitbank.cc/" },
+            { name: "Coin68", description: "Cập nhật hệ sinh thái đầy đủ, nhanh nhạy tại Việt Nam.", url: "https://coin68.com/" },
         ],
     },
 ];
@@ -51,15 +45,21 @@ const tradingViewIndicators = [
 ];
 
 export default function NewsfeedPage() {
+    // Tính toán tổng số lượng nguồn tin một cách tự động
+    const totalSources = groups.reduce((total, group) => total + group.sources.length, 0);
+
     return (
         <main className="newsfeed-page">
             <header className="newsfeed-header">
                 <div>
                     <p className="eyebrow">Market intelligence desk</p>
                     <h1>Newsfeed sources</h1>
-                    <p className="newsfeed-intro">Một bảng điều hướng gọn cho các nguồn tin nhanh, dữ liệu on-chain và phân tích vĩ mô.</p>
+                    <p className="newsfeed-intro">Một bảng điều hướng chuẩn hóa cho các nguồn tin tài chính, địa chính trị và crypto.</p>
                 </div>
-                <div className="source-count"><strong>15</strong><span>curated sources</span></div>
+                <div className="source-count">
+                    <strong>{totalSources}</strong>
+                    <span>curated sources</span>
+                </div>
             </header>
 
             <section className="tradingview-panel" aria-labelledby="macro-title">
@@ -80,11 +80,17 @@ export default function NewsfeedPage() {
             <div className="source-groups">
                 {groups.map((group) => (
                     <section className="source-group" key={group.number}>
-                        <div className="group-heading"><span className="group-number">{group.number}</span><div><h2>{group.title}</h2><p>{group.summary}</p></div></div>
+                        <div className="group-heading">
+                            <span className="group-number">{group.number}</span>
+                            <div><h2>{group.title}</h2><p>{group.summary}</p></div>
+                        </div>
                         <div className="source-grid">
                             {group.sources.map((source) => (
                                 <article className="source-card" key={source.name}>
-                                    <div className="source-card-top"><span className="source-mark">{source.name.slice(0, 1)}</span><span className="integration-badge">Mở trực tiếp</span></div>
+                                    <div className="source-card-top">
+                                        <span className="source-mark">{source.name.slice(0, 1)}</span>
+                                        <span className="integration-badge">Mở trực tiếp</span>
+                                    </div>
                                     <h3>{source.name}</h3>
                                     {source.handle && <p className="source-handle">{source.handle}</p>}
                                     <p className="source-description">{source.description}</p>

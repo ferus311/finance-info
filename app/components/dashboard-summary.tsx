@@ -21,7 +21,7 @@ export function DashboardSummary({
 }: DashboardSummaryProps) {
     return (
         <Card>
-            <Space direction="vertical" size={8} style={{ width: "100%", gap: 6 }}>
+            <Space orientation="vertical" size={8} style={{ width: "100%", gap: 6 }}>
                 <Typography.Title level={2} style={{ margin: 0 }}>
                     Finance Dashboard
                 </Typography.Title>

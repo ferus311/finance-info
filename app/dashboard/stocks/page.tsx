@@ -5,7 +5,6 @@ import { App, ConfigProvider, Layout, Space, message } from "antd";
 import { DashboardSummary } from "@/components/dashboard-summary";
 import { MarketSection } from "@/components/market-section";
 import { getNearestWeekday, toApiDate, toDateInputFromApi, toDateInputValue } from "@/lib/date";
-import { loadWatchlist, saveWatchlist } from "@/lib/storage";
 import type { MarketResponse, MarketRow } from "@/types/market";
 
 const POLL_INTERVAL = 10000;
@@ -14,19 +13,9 @@ const DEFAULT_STOCK_SYMBOLS = ["SSI", "GAS"];
 
 export default function StocksPage() {
     const [messageApi, contextHolder] = message.useMessage();
-    const [persisted] = useState(() => {
-        if (typeof window === "undefined") {
-            return { cryptoSymbols: [], stockSymbols: [], vnDate: null as string | null };
-        }
-
-        return loadWatchlist();
-    });
-    const [cryptoSymbols, setCryptoSymbols] = useState<string[]>(() =>
-        persisted.cryptoSymbols.length > 0 ? persisted.cryptoSymbols : DEFAULT_CRYPTO_SYMBOLS,
-    );
-    const [stockSymbols, setStockSymbols] = useState<string[]>(() =>
-        persisted.stockSymbols.length > 0 ? persisted.stockSymbols : DEFAULT_STOCK_SYMBOLS,
-    );
+    const [cryptoSymbols, setCryptoSymbols] = useState<string[]>(DEFAULT_CRYPTO_SYMBOLS);
+    const [stockSymbols, setStockSymbols] = useState<string[]>(DEFAULT_STOCK_SYMBOLS);
+    const [dataLoaded, setDataLoaded] = useState(false);
     const [cryptoRows, setCryptoRows] = useState<MarketRow[]>([]);
     const [stockRows, setStockRows] = useState<MarketRow[]>([]);
     const [cryptoLoading, setCryptoLoading] = useState(true);
@@ -82,8 +71,25 @@ export default function StocksPage() {
     }, [stockSymbols, vnDate]);
 
     useEffect(() => {
-        saveWatchlist(cryptoSymbols, stockSymbols, vnDate);
-    }, [cryptoSymbols, stockSymbols, vnDate]);
+        fetch("/api/user/data", { cache: "no-store" })
+            .then((response) => response.ok ? response.json() : Promise.reject(new Error("Could not load account data")))
+            .then((data: { watchlist?: { cryptoSymbols?: string[]; stockSymbols?: string[]; vnDate?: string | null } }) => {
+                const watchlist = data.watchlist;
+                if (watchlist?.cryptoSymbols?.length) setCryptoSymbols(watchlist.cryptoSymbols);
+                if (watchlist?.stockSymbols?.length) setStockSymbols(watchlist.stockSymbols);
+                if (watchlist?.vnDate) setVnDate(toDateInputFromApi(watchlist.vnDate));
+            })
+            .finally(() => setDataLoaded(true));
+    }, []);
+
+    useEffect(() => {
+        if (!dataLoaded) return;
+        void fetch("/api/user/data", {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ watchlist: { cryptoSymbols, stockSymbols, vnDate: toApiDate(vnDate) } }),
+        });
+    }, [cryptoSymbols, stockSymbols, vnDate, dataLoaded]);
 
     useEffect(() => {
         let isMounted = true;
@@ -204,7 +210,7 @@ export default function StocksPage() {
                 {contextHolder}
                 <Layout className="dashboard-root">
                     <Layout.Content className="dashboard-content">
-                        <Space direction="vertical" size={20} style={{ width: "100%" }}>
+                        <Space orientation="vertical" size={20} style={{ width: "100%" }}>
                             <DashboardSummary
                                 totalCrypto={totalCrypto}
                                 totalStocks={totalStocks}

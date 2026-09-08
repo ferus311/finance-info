@@ -1,0 +1,204 @@
+.trade-page {
+    min-height: 100%;
+    background: #f3f7f5;
+}
+
+.trade-content {
+    max-width: 1480px;
+    width: 100%;
+    margin: 0 auto;
+    padding: 28px clamp(16px, 3vw, 42px) 48px;
+}
+
+.trade-heading {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+    gap: 24px;
+    margin-bottom: 24px;
+}
+
+.trade-heading h1 {
+    margin: 4px 0 6px;
+    color: #163d38;
+    font-size: clamp(28px, 4vw, 44px);
+    letter-spacing: 0;
+}
+
+.trade-heading p {
+    max-width: 680px;
+    margin: 0;
+    color: #62716d;
+    font-size: 15px;
+}
+
+.header-actions {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+}
+
+.eyebrow {
+    color: #0f766e;
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: 1.6px;
+}
+
+.scenario-tabs .ant-tabs-nav {
+    margin-bottom: 18px;
+}
+
+.scenario-tabs .ant-tabs-tab {
+    background: #e3eeea;
+    border: 0;
+    border-radius: 8px 8px 0 0;
+}
+
+.scenario-tabs .ant-tabs-tab-active {
+    background: #fff;
+}
+
+.metrics-row .ant-card {
+    border: 0;
+    box-shadow: 0 5px 18px rgba(25, 77, 65, .07);
+}
+
+.metrics-row .ant-statistic-title {
+    color: #71807c;
+    font-size: 12px;
+}
+
+.metrics-row .ant-card {
+    min-height: 130px;
+}
+
+.metrics-row .ant-statistic-content {
+    color: #163d38;
+    font-weight: 750;
+    white-space: nowrap;
+    font-size: clamp(18px, 2vw, 28px);
+    line-height: 1.3;
+}
+
+.trade-card {
+    border: 0;
+    box-shadow: 0 7px 24px rgba(25, 77, 65, .075);
+}
+
+.trade-card .ant-card-head {
+    border-bottom-color: #e8f0ed;
+}
+
+.trade-card .ant-card-head-title {
+    color: #214c45;
+}
+
+.strategy-note-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+    padding: 4px 2px 8px;
+}
+
+.strategy-note-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid #ebf0ef;
+}
+
+.eyebrow.secondary {
+    display: inline-block;
+    margin-bottom: 6px;
+    color: #0f766e;
+    font-size: 10px;
+    letter-spacing: 1.4px;
+    text-transform: uppercase;
+}
+
+.blocknote-shell {
+    border: 1px solid #edf3f1;
+    border-radius: 18px;
+    background: linear-gradient(180deg, #fbfdfc 0%, #f5f9f8 100%);
+    min-height: 420px;
+    overflow: hidden;
+}
+
+.blocknote-shell .bn-editor {
+    min-height: 420px;
+    background: transparent;
+}
+
+.blocknote-shell .bn-block {
+    min-height: 32px;
+}
+
+.blocknote-shell .bn-block-content {
+    font-size: 14px;
+    line-height: 1.7;
+    color: #173f37;
+}
+
+.blocknote-shell .bn-menu {
+    border-radius: 12px;
+}
+
+.note-composer {
+    display: none;
+}
+
+.strategy-note-modal .ant-modal-content {
+    border-radius: 22px;
+    overflow: hidden;
+}
+
+.strategy-note-modal .ant-modal-header {
+    padding: 18px 24px 12px;
+    border-bottom-color: #edf2f0;
+}
+
+.strategy-note-modal .ant-modal-body {
+    max-height: min(78vh, 860px);
+    overflow: auto;
+    padding: 10px 20px 20px;
+    background: #f7faf9;
+}
+
+.order-history {
+    margin-top: 18px;
+}
+
+.ant-table-cell {
+    white-space: nowrap;
+}
+
+@media (max-width: 640px) {
+    .trade-content {
+        padding-top: 18px;
+    }
+
+    .trade-heading {
+        align-items: flex-start;
+        flex-direction: column;
+        gap: 14px;
+    }
+
+    .header-actions {
+        width: 100%;
+        justify-content: space-between;
+    }
+
+    .header-actions .ant-btn {
+        flex: 1;
+    }
+
+    .scenario-tabs .ant-tabs-extra-content {
+        display: none;
+    }
+
+    .metrics-row .ant-statistic-content {
+        white-space: normal;
+    }
+}
