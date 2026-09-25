@@ -1,0 +1,116 @@
+.app-main-layout {
+    min-height: 100vh;
+    background: #f5f7fb;
+}
+
+.app-main-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    box-shadow: 0 1px 2px rgba(16, 24, 40, 0.05);
+}
+
+.app-top-nav {
+    flex: 1;
+    min-width: 0;
+    border-bottom: 0;
+}
+
+.app-top-nav>.ant-menu-item-only-child {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+
+.app-sider-toggle {
+    margin-left: 8px;
+    margin-right: 8px;
+}
+
+.app-main-body {
+    min-height: 0;
+    flex: 1;
+    overflow: hidden;
+}
+
+.app-main-content-shell {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    padding: 12px;
+}
+
+.app-main-content {
+    min-height: 0;
+    overflow: auto;
+    background: #ffffff;
+    /* margin: 16px; */
+}
+
+.demo-logo {
+    min-width: 200px;
+    max-width: 200px;
+}
+
+.demo-logo img {
+    display: block;
+    object-fit: contain;
+}
+
+.ant-layout-sider {
+    min-width: 0 !important;
+    max-width: none !important;
+}
+
+
+.ant-layout-sider-trigger {
+    --ant-layout-trigger-bg: #fffffff !important;
+}
+
+.ant-layout-sider-trigger svg {
+    color: black !important;
+}
+
+.ant-layout-sider-children {
+    height: 100%;
+}
+
+.ant-menu-inline .ant-menu-submenu-title,
+.ant-menu-inline .ant-menu-item {
+    border-radius: 8px;
+    margin-inline: 8px;
+    width: auto;
+}
+
+@media (max-width: 991px) {
+    .demo-logo {
+        width: 140px !important;
+        min-width: 140px;
+        height: 40px;
+    }
+
+    .demo-logo img {
+        max-width: 100%;
+        max-height: 100%;
+    }
+
+    .app-main-content-shell {
+        padding: 8px 8px 8px 0;
+    }
+}
+
+@media (max-width: 575px) {
+    .app-main-header {
+        padding-right: 8px;
+    }
+
+    .demo-logo {
+        width: 112px !important;
+        min-width: 112px;
+        height: 32px;
+    }
+
+    .app-top-nav {
+        display: none;
+    }
+}

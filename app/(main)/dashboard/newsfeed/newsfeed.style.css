@@ -5,6 +5,7 @@
     --paper: #f6f8f4;
     min-height: 100%;
     padding: clamp(24px, 4vw, 56px);
+    font-family: monospace;
     color: var(--ink);
     background:
         radial-gradient(circle at 100% 0%, rgba(226, 237, 216, 0.7), transparent 28%),
@@ -41,7 +42,7 @@
 .tradingview-panel h2,
 .group-heading h2,
 .source-card h3 {
-    font-family: Georgia, "Times New Roman", serif;
+    font-family: "Times New Roman", serif;
     font-weight: 500;
 }
 

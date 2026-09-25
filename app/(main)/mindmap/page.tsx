@@ -140,6 +140,7 @@ export default function MindmapPage() {
     const [isCreatingNotebook, setIsCreatingNotebook] = useState(false);
     const [editingNotebookId, setEditingNotebookId] = useState<string | null>(null);
     const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+    const [recentlyDeletedNotebook, setRecentlyDeletedNotebook] = useState<Notebook | null>(null);
 
     const [nodes, setNodes] = useState<MindNode[]>([]);
     const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -149,11 +150,33 @@ export default function MindmapPage() {
 
     const [zoom, setZoom] = useState(1);
     const [pan, setPan] = useState(DEFAULT_PAN);
+    const [autoArrange, setAutoArrange] = useState(true);
+    const [boardActive, setBoardActive] = useState(false);
 
     const containerRef = useRef<HTMLDivElement>(null);
     const contextMenuRef = useRef<HTMLDivElement>(null);
     const panRef = useRef({ panning: false });
     const dragRef = useRef<{ type: 'move' | 'resize' | null, id: string | null, startX: number, startY: number, startW: number, startH: number }>({ type: null, id: null, startX: 0, startY: 0, startW: 0, startH: 0 });
+    const nodesRef = useRef<MindNode[]>([]);
+
+    useEffect(() => {
+        nodesRef.current = nodes;
+    }, [nodes]);
+
+    useEffect(() => {
+        const handleWindowWheel = (event: WheelEvent) => {
+            const target = event.target as Node | null;
+            if (!containerRef.current || !target) return;
+
+            const isInsideBoard = containerRef.current.contains(target);
+            if (!isInsideBoard) return;
+
+            event.preventDefault();
+        };
+
+        window.addEventListener('wheel', handleWindowWheel, { passive: false });
+        return () => window.removeEventListener('wheel', handleWindowWheel);
+    }, [activeNotebookId]);
 
     const edges = useMemo(() => {
         return nodes.filter((n) => n.parentId).map((n) => {
@@ -221,10 +244,10 @@ export default function MindmapPage() {
 
             if (e.key === 'Enter') {
                 e.preventDefault();
-                createNode(node.parentId, '', 'text', null, DEFAULT_W, DEFAULT_H, node.y + (node.height || DEFAULT_H) + 10);
+                createNode(node.parentId, '', 'text');
             } else if (e.key === 'Tab') {
                 e.preventDefault();
-                createNode(node.id, '', 'text', null, DEFAULT_W, DEFAULT_H, node.y + 10);
+                createNode(node.id, '', 'text');
             } else if (e.key === 'F2') {
                 e.preventDefault();
                 setEditingId(node.id);
@@ -283,18 +306,48 @@ export default function MindmapPage() {
     }, [activeNotebookId, selectedId, editingId, pan, zoom, nodes]);
 
     function persistPositions(list: MindNode[]) {
-        apiFetch(`${API_BASE}`, {
+        void apiFetch(`${API_BASE}`, {
             method: 'PATCH', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ resource: 'nodes-bulk', nodes: list.map((n) => ({ id: n.id, x: n.x, y: n.y })) }),
-        });
+        }).catch(() => setError('Could not save node positions.'));
     }
 
-    function createNotebook(title: string) {
-        const id = crypto.randomUUID(), rootId = crypto.randomUUID(), cleanTitle = title.trim() || 'Untitled notebook';
-        setNotebooks((prev) => [...prev, { id, title: cleanTitle }]); setActiveNotebookId(id);
-        setNodes([{ id: rootId, notebookId: id, parentId: null, text: 'Central idea', x: 0, y: 0, type: 'text', width: DEFAULT_W, height: DEFAULT_H, imageUrl: null, preserveAspect: true, color: null }]);
-        setPan(DEFAULT_PAN); setZoom(1);
-        apiFetch(`${API_BASE}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ resource: 'notebook', id, title: cleanTitle, rootId }) });
+    function createStableId() {
+        const cryptoObj = typeof globalThis !== 'undefined' ? globalThis.crypto : undefined;
+        if (cryptoObj && typeof cryptoObj.randomUUID === 'function') {
+            return cryptoObj.randomUUID();
+        }
+
+        return `node-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+    }
+
+    function getBranchBottomY(list: MindNode[], parentId: string | null, parentNode?: MindNode | null) {
+        if (!parentId) return 0;
+        const parent = parentNode ?? list.find((n) => n.id === parentId);
+        if (!parent) return 0;
+
+        const children = list.filter((n) => n.parentId === parentId).sort((a, b) => b.y - a.y);
+        if (children.length === 0) return parent.y + (parent.height || DEFAULT_H) + 16;
+
+        const bottomNode = children.reduce((latest, n) => {
+            const candidateBottom = n.y + (n.height || DEFAULT_H);
+            return candidateBottom > latest ? candidateBottom : latest;
+        }, parent.y + (parent.height || DEFAULT_H));
+
+        return bottomNode + 16;
+    }
+
+    async function createNotebook(title: string) {
+        const id = createStableId(), rootId = createStableId(), cleanTitle = title.trim() || 'Untitled notebook';
+        try {
+            await apiFetch(`${API_BASE}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ resource: 'notebook', id, title: cleanTitle, rootId }) });
+            setNotebooks((prev) => [...prev, { id, title: cleanTitle }]);
+            setActiveNotebookId(id);
+            setNodes([{ id: rootId, notebookId: id, parentId: null, text: 'Central idea', x: 0, y: 0, type: 'text', width: DEFAULT_W, height: DEFAULT_H, imageUrl: null, preserveAspect: true, color: null }]);
+            setPan(DEFAULT_PAN); setZoom(1);
+        } catch {
+            setError('Could not create this notebook.');
+        }
     }
 
     function renameNotebook(id: string, title: string) {
@@ -303,19 +356,42 @@ export default function MindmapPage() {
         apiFetch(`${API_BASE}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ resource: 'notebook', id, title: cleanTitle }) });
     }
 
-    function deleteNotebook(id: string) {
+    async function deleteNotebook(id: string) {
         if (!window.confirm('Delete this notebook and every idea on it?')) return;
-        const remaining = notebooks.filter((n) => n.id !== id);
-        setNotebooks(remaining);
-        if (activeNotebookId === id) setActiveNotebookId(remaining[0]?.id ?? null);
-        apiFetch(`${API_BASE}?resource=notebook&id=${id}`, { method: 'DELETE' });
+        const deletedNotebook = notebooks.find((notebook) => notebook.id === id);
+        if (!deletedNotebook) return;
+
+        try {
+            await apiFetch(`${API_BASE}?resource=notebook&id=${id}`, { method: 'DELETE' });
+            const remaining = notebooks.filter((n) => n.id !== id);
+            setNotebooks(remaining);
+            setRecentlyDeletedNotebook(deletedNotebook);
+            if (activeNotebookId === id) setActiveNotebookId(remaining[0]?.id ?? null);
+        } catch {
+            setError('Could not delete this notebook.');
+        }
     }
 
-    // Function Create Node đã tối ưu functional state update để triệt tiêu lỗi mất chữ
-    function createNode(parentId: string | null, text = '', type: 'text' | 'image' = 'text', imageUrl: string | null = null, width = DEFAULT_W, height = DEFAULT_H, referenceY?: number) {
+    async function restoreNotebook() {
+        if (!recentlyDeletedNotebook) return;
+        try {
+            await apiFetch(`${API_BASE}`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ resource: 'notebook', action: 'restore', id: recentlyDeletedNotebook.id }),
+            });
+            setNotebooks((prev) => [...prev, recentlyDeletedNotebook]);
+            setActiveNotebookId(recentlyDeletedNotebook.id);
+            setRecentlyDeletedNotebook(null);
+        } catch {
+            setError('Could not restore this notebook.');
+        }
+    }
+
+    function createNode(parentId: string | null, text = '', type: 'text' | 'image' = 'text', imageUrl: string | null = null, width = DEFAULT_W, height = DEFAULT_H) {
         if (!activeNotebookId) return;
 
-        const newNodeId = crypto.randomUUID();
+        const newNodeId = createStableId();
 
         setNodes(prevNodes => {
             const parent = parentId ? prevNodes.find(n => n.id === parentId) : null;
@@ -326,9 +402,8 @@ export default function MindmapPage() {
                 const pEl = document.getElementById(`node-${parent.id}`);
                 const pW = pEl ? pEl.offsetWidth : (parent.width || DEFAULT_W);
                 initialX = parent.x + pW + LEVEL_GAP_X;
+                initialY = getBranchBottomY(prevNodes, parentId, parent);
             }
-            if (referenceY !== undefined) initialY = referenceY;
-            else if (parent) initialY = parent.y;
 
             const newNode: MindNode = {
                 id: newNodeId, notebookId: activeNotebookId, parentId, text,
@@ -341,7 +416,7 @@ export default function MindmapPage() {
             apiFetch(`${API_BASE}`, {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ resource: 'node', ...newNode, imageUrl, preserveAspect: 1 })
-            }).then(() => { if (parentId) persistPositions(laidOut); });
+            }).then(() => { if (parentId) persistPositions(laidOut); }).catch(() => setError('Could not save this node.'));
 
             return laidOut;
         });
@@ -390,9 +465,18 @@ export default function MindmapPage() {
         if (!id) return;
 
         if (type === 'move') {
-            setNodes(prev => prev.map(n => n.id === id ? { ...n, x: n.x + e.movementX / zoom, y: n.y + e.movementY / zoom } : n));
+            const dx = e.movementX / zoom;
+            const dy = e.movementY / zoom;
+            setNodes(prev => {
+                if (!autoArrange) {
+                    return prev.map(n => n.id === id ? { ...n, x: n.x + dx, y: n.y + dy } : n);
+                }
+
+                const subtreeIds = collectSubtreeIds(prev, id);
+                return prev.map(n => subtreeIds.has(n.id) ? { ...n, x: n.x + dx, y: n.y + dy } : n);
+            });
         } else if (type === 'resize') {
-            const node = nodes.find(n => n.id === id);
+            const node = nodesRef.current.find(n => n.id === id);
             if (!node) return;
             let newW = Math.max(80, startW + (e.clientX - startX) / zoom);
             let newH = Math.max(40, startH + (e.clientY - startY) / zoom);
@@ -409,8 +493,18 @@ export default function MindmapPage() {
     function handlePointerUp() {
         const { id, type } = dragRef.current;
         if (id) {
-            const node = nodes.find(n => n.id === id);
-            if (node) updateNodeProps(id, type === 'resize' ? { width: node.width, height: node.height } : { x: node.x, y: node.y });
+            const liveNode = nodesRef.current.find(n => n.id === id);
+            if (!liveNode) {
+                dragRef.current.id = null;
+                return;
+            }
+
+            if (type === 'resize') {
+                updateNodeProps(id, { width: liveNode.width, height: liveNode.height });
+            } else {
+                const movedIds = autoArrange ? collectSubtreeIds(nodesRef.current, id) : new Set([id]);
+                persistPositions(nodesRef.current.filter(n => movedIds.has(n.id)));
+            }
         }
         dragRef.current.id = null;
     }
@@ -423,15 +517,28 @@ export default function MindmapPage() {
     function handleBackgroundPointerUp() { panRef.current.panning = false; }
 
     function handleWheel(e: ReactWheelEvent<HTMLDivElement>) {
-        e.preventDefault(); const rect = containerRef.current?.getBoundingClientRect(); if (!rect) return;
-        const mouseX = e.clientX - rect.left, mouseY = e.clientY - rect.top, delta = -e.deltaY * 0.0012;
+        const isWithinBoard = !!containerRef.current && containerRef.current.contains(e.target as Node);
+        if (!isWithinBoard) return;
+
+        e.preventDefault();
+        e.stopPropagation();
+
+        const rect = containerRef.current?.getBoundingClientRect();
+        if (!rect) return;
+
+        const mouseX = e.clientX - rect.left;
+        const mouseY = e.clientY - rect.top;
+        const delta = -e.deltaY * 0.0014;
+
         setZoom((prevZoom) => {
-            const newZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, prevZoom * (1 + delta)));
-            setPan((prevPan) => {
-                const worldX = (mouseX - prevPan.x) / prevZoom, worldY = (mouseY - prevPan.y) / prevZoom;
-                return { x: mouseX - worldX * newZoom, y: mouseY - worldY * newZoom };
+            const nextZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, prevZoom * (1 + delta)));
+            const worldX = (mouseX - pan.x) / prevZoom;
+            const worldY = (mouseY - pan.y) / prevZoom;
+            setPan({
+                x: mouseX - worldX * nextZoom,
+                y: mouseY - worldY * nextZoom,
             });
-            return newZoom;
+            return nextZoom;
         });
     }
 
@@ -479,12 +586,22 @@ export default function MindmapPage() {
                 ref={containerRef}
                 className="relative flex-1 overflow-hidden"
                 style={{
+                    height: '100%',
                     backgroundImage: 'linear-gradient(to right, #E4E4ED66 1px, transparent 1px), linear-gradient(to bottom, #E4E4ED66 1px, transparent 1px)',
                     backgroundSize: `${40 * zoom}px ${40 * zoom}px`,
                     backgroundPosition: `${pan.x}px ${pan.y}px`,
                     touchAction: 'none',
+                    overflow: 'hidden',
+                    overscrollBehavior: 'none',
                 }}
-                onContextMenu={(e) => e.preventDefault()} onPointerDown={handleBackgroundPointerDown} onPointerMove={handleBackgroundPointerMove} onPointerUp={handleBackgroundPointerUp} onPointerLeave={handleBackgroundPointerUp} onWheel={handleWheel}
+                onContextMenu={(e) => e.preventDefault()}
+                onPointerDown={(e: ReactPointerEvent<HTMLDivElement>) => { setBoardActive(true); handleBackgroundPointerDown(e); }}
+                onPointerMove={(e: ReactPointerEvent<HTMLDivElement>) => { setBoardActive(true); handleBackgroundPointerMove(e); }}
+                onPointerUp={() => { setBoardActive(true); handleBackgroundPointerUp(); }}
+                onPointerLeave={() => { setBoardActive(false); handleBackgroundPointerUp(); }}
+                onMouseEnter={() => setBoardActive(true)}
+                onMouseLeave={() => setBoardActive(false)}
+                onWheel={handleWheel}
             >
                 <div className="absolute left-6 top-6 z-10 flex items-center gap-2">
                     <button onClick={() => setIsSidebarOpen(v => !v)} className="flex h-10 w-10 items-center justify-center rounded-xl bg-white border border-[#E4E4ED] shadow-sm text-[#4B4A5C] hover:bg-[#F2F1FA] transition-colors">
@@ -496,6 +613,16 @@ export default function MindmapPage() {
                     <button onClick={rearrangeAll} disabled={!activeNotebookId} className="flex h-10 items-center justify-center gap-1.5 rounded-xl bg-white border border-[#E4E4ED] px-4 font-bold text-sm text-[#4B4A5C] shadow-sm hover:bg-[#F2F1FA] transition-colors disabled:cursor-not-allowed disabled:opacity-40">
                         <SparkleIcon /> Auto-arrange all
                     </button>
+                    <label className="flex items-center gap-2 rounded-xl border border-[#E4E4ED] bg-white px-3 py-2 text-xs font-semibold text-[#4B4A5C] shadow-sm">
+                        <span>Follow children</span>
+                        <button
+                            type="button"
+                            aria-label="Toggle auto arrange"
+                            onClick={() => setAutoArrange((value) => !value)}
+                            className={`relative h-6 w-11 rounded-full transition-colors ${autoArrange ? 'bg-[#7B61FF]' : 'bg-[#D9D7E6]'}`}>
+                            <span className={`absolute top-1 h-4 w-4 rounded-full bg-white transition-transform ${autoArrange ? 'translate-x-6' : 'translate-x-1'}`} />
+                        </button>
+                    </label>
                     <div className="flex h-10 items-center gap-1 rounded-xl bg-white border border-[#E4E4ED] px-2 shadow-sm text-[#4B4A5C]">
                         <button onClick={() => setZoom((z) => Math.max(MIN_ZOOM, +(z - 0.1).toFixed(2)))} className="flex h-7 w-7 items-center justify-center rounded-lg text-base font-medium hover:bg-[#F2F1FA]">−</button>
                         <button onClick={resetView} className="min-w-[46px] text-center text-xs font-bold text-[#8A8A9A] hover:text-[#4B4A5C]">{Math.round(zoom * 100)}%</button>
@@ -549,16 +676,16 @@ export default function MindmapPage() {
                                                         if (e.ctrlKey || e.metaKey) {
                                                             // Ctrl + Enter: Tạo nhánh ngang cấp cha
                                                             const parentNode = nodes.find(n => n.id === node.parentId);
-                                                            createNode(parentNode ? parentNode.parentId : null, '', 'text', null, DEFAULT_W, DEFAULT_H, node.y + (node.height || DEFAULT_H) + 10);
+                                                            createNode(parentNode ? parentNode.parentId : null, '', 'text');
                                                         } else {
                                                             // Enter: Tạo nhánh ngang hàng (Sibling)
-                                                            createNode(node.parentId, '', 'text', null, DEFAULT_W, DEFAULT_H, node.y + (node.height || DEFAULT_H) + 10);
+                                                            createNode(node.parentId, '', 'text');
                                                         }
                                                     } else if (e.key === 'Tab') {
                                                         // Tab: Tạo nhánh con (Child)
                                                         e.preventDefault();
                                                         updateNodeProps(node.id, { text: e.currentTarget.value });
-                                                        createNode(node.id, '', 'text', null, DEFAULT_W, DEFAULT_H, node.y + 10);
+                                                        createNode(node.id, '', 'text');
                                                     } else if (e.key === 'Escape') {
                                                         setEditingId(null);
                                                     }
@@ -574,7 +701,7 @@ export default function MindmapPage() {
                                     </div>
                                 )}
 
-                                <button onPointerDown={(e) => e.stopPropagation()} onClick={(e) => { e.stopPropagation(); createNode(node.id, '', 'text', null, DEFAULT_W, DEFAULT_H, node.y + 10); }} className="absolute -right-3 top-1/2 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded-full bg-[#7B61FF] text-white opacity-0 shadow-md transition-opacity duration-150 group-hover:opacity-100 hover:bg-[#6A4FF5]"><PlusIcon /></button>
+                                <button onPointerDown={(e) => e.stopPropagation()} onClick={(e) => { e.stopPropagation(); createNode(node.id, '', 'text'); }} className="absolute -right-3 top-1/2 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded-full bg-[#7B61FF] text-white opacity-0 shadow-md transition-opacity duration-150 group-hover:opacity-100 hover:bg-[#6A4FF5]"><PlusIcon /></button>
                                 <div onPointerDown={(e) => handleResizePointerDown(e, node)} className={`absolute bottom-0 right-0 w-4 h-4 cursor-nwse-resize opacity-0 group-hover:opacity-100 ${isSelected ? 'opacity-100' : ''}`} style={{ background: 'linear-gradient(135deg, transparent 50%, #B9AEFF 50%)', borderBottomRightRadius: '14px' }} />
                             </div>
                         );
@@ -582,9 +709,16 @@ export default function MindmapPage() {
                 </div>
             </main>
 
+            {recentlyDeletedNotebook && (
+                <div className="fixed bottom-6 left-1/2 z-40 flex -translate-x-1/2 items-center gap-3 rounded-xl border border-[#E4E4ED] bg-white px-4 py-3 text-sm text-[#333244] shadow-xl">
+                    <span>Notebook moved to trash.</span>
+                    <button onClick={restoreNotebook} className="font-bold text-[#5B45E5] hover:text-[#432FC7]">Undo</button>
+                </div>
+            )}
+
             {contextMenu && (
                 <div ref={contextMenuRef} style={{ position: 'fixed', left: contextMenu.x, top: contextMenu.y }} className="z-50 w-56 overflow-hidden rounded-xl border border-[#E4E4ED] bg-white py-1.5 shadow-xl text-black">
-                    <MenuItem label="Add child idea" onClick={() => { createNode(contextMenu.nodeId, '', 'text', null, DEFAULT_W, DEFAULT_H, nodes.find(n => n.id === contextMenu.nodeId)!.y + 10); setContextMenu(null); }} />
+                    <MenuItem label="Add child idea" onClick={() => { createNode(contextMenu.nodeId, '', 'text'); setContextMenu(null); }} />
                     <MenuItem label="Rename" onClick={() => { setEditingId(contextMenu.nodeId); setContextMenu(null); }} />
 
                     {nodes.find(n => n.id === contextMenu.nodeId)?.type === 'image' && (

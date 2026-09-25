@@ -49,6 +49,7 @@ function getDb(): Database.Database {
 
     // Safe Migrations: Tự động thêm cột tính năng mới nếu chưa có
     const addCol = (query: string) => { try { db.exec(query); } catch (e) { /* Cột đã tồn tại */ } };
+    addCol("ALTER TABLE mindmap_notebooks ADD COLUMN deleted_at TEXT DEFAULT NULL");
     addCol("ALTER TABLE mindmap_nodes ADD COLUMN type TEXT DEFAULT 'text'");
     addCol("ALTER TABLE mindmap_nodes ADD COLUMN width REAL DEFAULT 208");
     addCol("ALTER TABLE mindmap_nodes ADD COLUMN height REAL DEFAULT 60");
@@ -80,7 +81,7 @@ export async function GET(req: NextRequest) {
         }
 
         if (resource === 'notebooks') {
-            const rows = db.prepare('SELECT * FROM mindmap_notebooks ORDER BY created_at ASC').all();
+            const rows = db.prepare('SELECT * FROM mindmap_notebooks WHERE deleted_at IS NULL ORDER BY created_at ASC').all();
             return NextResponse.json({ notebooks: rows });
         }
 
@@ -145,6 +146,11 @@ export async function PATCH(req: NextRequest) {
         const body = await req.json();
 
         if (body.resource === 'notebook') {
+            if (body.action === 'restore') {
+                db.prepare('UPDATE mindmap_notebooks SET deleted_at = NULL, updated_at = ? WHERE id = ?').run(nowIso(), body.id);
+                return NextResponse.json({ ok: true });
+            }
+
             db.prepare('UPDATE mindmap_notebooks SET title = ?, updated_at = ? WHERE id = ?').run(
                 String(body.title || 'Untitled').slice(0, 120), nowIso(), body.id
             );
@@ -179,36 +185,21 @@ export async function PATCH(req: NextRequest) {
 }
 
 export async function DELETE(req: NextRequest) {
-  const resource = req.nextUrl.searchParams.get('resource');
-  const id = req.nextUrl.searchParams.get('id');
-  if (!id) return badRequest('id is required');
+    const resource = req.nextUrl.searchParams.get('resource');
+    const id = req.nextUrl.searchParams.get('id');
+    if (!id) return badRequest('id is required');
 
-  try {
-    const db = getDb();
+    try {
+        const db = getDb();
 
-    if (resource === 'notebook') {
-      // Quét tất cả các node thuộc Notebook này có chứa ảnh
-      const nodesWithImages = db.prepare(`
-        SELECT image_url FROM mindmap_nodes
-        WHERE notebook_id = ? AND image_url IS NOT NULL
-      `).all(id) as { image_url: string }[];
-
-      // Xóa toàn bộ file vật lý trước khi xóa Notebook
-      for (const node of nodesWithImages) {
-        const match = node.image_url?.match(/name=([^&]+)/);
-        if (match && match[1]) {
-          const filePath = join(IMAGE_DIR, match[1]);
-          if (existsSync(filePath)) try { unlinkSync(filePath); } catch (e) {}
+        if (resource === 'notebook') {
+            db.prepare('UPDATE mindmap_notebooks SET deleted_at = ?, updated_at = ? WHERE id = ?').run(nowIso(), nowIso(), id);
+            return NextResponse.json({ ok: true });
         }
-      }
 
-      db.prepare('DELETE FROM mindmap_notebooks WHERE id = ?').run(id);
-      return NextResponse.json({ ok: true });
-    }
-
-    if (resource === 'node') {
-      // Dùng CTE đệ quy quét Node hiện tại VÀ TOÀN BỘ các Node con/cháu của nó
-      const nodesWithImages = db.prepare(`
+        if (resource === 'node') {
+            // Dùng CTE đệ quy quét Node hiện tại VÀ TOÀN BỘ các Node con/cháu của nó
+            const nodesWithImages = db.prepare(`
         WITH RECURSIVE descendants AS (
           SELECT id, image_url FROM mindmap_nodes WHERE id = ?
           UNION ALL
@@ -218,22 +209,22 @@ export async function DELETE(req: NextRequest) {
         SELECT image_url FROM descendants WHERE image_url IS NOT NULL
       `).all(id) as { image_url: string }[];
 
-      // Xóa các file ảnh vật lý của nhánh sắp bị xóa
-      for (const node of nodesWithImages) {
-        const match = node.image_url?.match(/name=([^&]+)/);
-        if (match && match[1]) {
-          const filePath = join(IMAGE_DIR, match[1]);
-          if (existsSync(filePath)) try { unlinkSync(filePath); } catch (e) {}
+            // Xóa các file ảnh vật lý của nhánh sắp bị xóa
+            for (const node of nodesWithImages) {
+                const match = node.image_url?.match(/name=([^&]+)/);
+                if (match && match[1]) {
+                    const filePath = join(IMAGE_DIR, match[1]);
+                    if (existsSync(filePath)) try { unlinkSync(filePath); } catch (e) { }
+                }
+            }
+
+            // Xóa data trong DB (SQLite sẽ tự động Cascade xóa node con)
+            db.prepare('DELETE FROM mindmap_nodes WHERE id = ?').run(id);
+            return NextResponse.json({ ok: true });
         }
-      }
 
-      // Xóa data trong DB (SQLite sẽ tự động Cascade xóa node con)
-      db.prepare('DELETE FROM mindmap_nodes WHERE id = ?').run(id);
-      return NextResponse.json({ ok: true });
+        return badRequest('Unknown resource');
+    } catch (err) {
+        return serverError(err);
     }
-
-    return badRequest('Unknown resource');
-  } catch (err) {
-    return serverError(err);
-  }
 }

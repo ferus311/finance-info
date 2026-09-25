@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { usePathname } from "next/navigation";
 import { App, ConfigProvider, Layout, Space, message } from "antd";
 import { DashboardSummary } from "@/components/dashboard-summary";
 import { MarketSection } from "@/components/market-section";
@@ -12,10 +13,13 @@ const DEFAULT_CRYPTO_SYMBOLS = ["BTCUSDT", "SOLUSDT", "ETHUSDT", "ARBUSDT"];
 const DEFAULT_STOCK_SYMBOLS = ["SSI", "GAS"];
 
 export default function StocksPage() {
+    const pathname = usePathname();
+    const isStocksPageActive = pathname === "/dashboard/stocks";
     const [messageApi, contextHolder] = message.useMessage();
     const [cryptoSymbols, setCryptoSymbols] = useState<string[]>(DEFAULT_CRYPTO_SYMBOLS);
     const [stockSymbols, setStockSymbols] = useState<string[]>(DEFAULT_STOCK_SYMBOLS);
     const [dataLoaded, setDataLoaded] = useState(false);
+    const [isTabVisible, setIsTabVisible] = useState(true);
     const [cryptoRows, setCryptoRows] = useState<MarketRow[]>([]);
     const [stockRows, setStockRows] = useState<MarketRow[]>([]);
     const [cryptoLoading, setCryptoLoading] = useState(true);
@@ -92,6 +96,23 @@ export default function StocksPage() {
     }, [cryptoSymbols, stockSymbols, vnDate, dataLoaded]);
 
     useEffect(() => {
+        const handleVisibility = () => {
+            setIsTabVisible(document.visibilityState === "visible");
+        };
+
+        handleVisibility();
+        document.addEventListener("visibilitychange", handleVisibility);
+
+        return () => {
+            document.removeEventListener("visibilitychange", handleVisibility);
+        };
+    }, []);
+
+    useEffect(() => {
+        if (!isStocksPageActive || !isTabVisible) {
+            return;
+        }
+
         let isMounted = true;
 
         const run = async (silent = false) => {
@@ -121,9 +142,13 @@ export default function StocksPage() {
             isMounted = false;
             window.clearInterval(timer);
         };
-    }, [fetchCryptoQuotes, messageApi]);
+    }, [fetchCryptoQuotes, isStocksPageActive, isTabVisible, messageApi]);
 
     useEffect(() => {
+        if (!isStocksPageActive || !isTabVisible) {
+            return;
+        }
+
         let isMounted = true;
 
         const run = async (silent = false) => {
@@ -153,7 +178,7 @@ export default function StocksPage() {
             isMounted = false;
             window.clearInterval(timer);
         };
-    }, [fetchStockQuotes, messageApi]);
+    }, [fetchStockQuotes, isStocksPageActive, isTabVisible, messageApi]);
 
     const totalCrypto = useMemo(
         () => cryptoRows.filter((item) => item.status === "ok").length,
