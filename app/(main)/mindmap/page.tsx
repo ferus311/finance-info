@@ -608,19 +608,19 @@ export default function MindmapPage() {
                         <PanelLeftIcon />
                     </button>
                     <button onClick={() => createNode(null, '', 'text')} disabled={!activeNotebookId} className="flex h-10 items-center justify-center gap-1.5 rounded-xl bg-[#7B61FF] px-4 font-bold text-sm text-white shadow hover:bg-[#6A4FF5] transition-colors disabled:cursor-not-allowed disabled:opacity-40">
-                        <PlusIcon /> Add idea
+                        <PlusIcon /> Add
                     </button>
                     <button onClick={rearrangeAll} disabled={!activeNotebookId} className="flex h-10 items-center justify-center gap-1.5 rounded-xl bg-white border border-[#E4E4ED] px-4 font-bold text-sm text-[#4B4A5C] shadow-sm hover:bg-[#F2F1FA] transition-colors disabled:cursor-not-allowed disabled:opacity-40">
-                        <SparkleIcon /> Auto-arrange all
+                        <SparkleIcon /> Re-arrange
                     </button>
                     <label className="flex items-center gap-2 rounded-xl border border-[#E4E4ED] bg-white px-3 py-2 text-xs font-semibold text-[#4B4A5C] shadow-sm">
-                        <span>Follow children</span>
+                        <span>Follow</span>
                         <button
                             type="button"
                             aria-label="Toggle auto arrange"
                             onClick={() => setAutoArrange((value) => !value)}
                             className={`relative h-6 w-11 rounded-full transition-colors ${autoArrange ? 'bg-[#7B61FF]' : 'bg-[#D9D7E6]'}`}>
-                            <span className={`absolute top-1 h-4 w-4 rounded-full bg-white transition-transform ${autoArrange ? 'translate-x-6' : 'translate-x-1'}`} />
+                            <span className={`absolute top-1 left-0 h-4 w-4 rounded-full bg-white transition-transform ${autoArrange ? 'translate-x-6' : 'translate-x-1'}`} />
                         </button>
                     </label>
                     <div className="flex h-10 items-center gap-1 rounded-xl bg-white border border-[#E4E4ED] px-2 shadow-sm text-[#4B4A5C]">

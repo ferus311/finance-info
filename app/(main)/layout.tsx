@@ -86,6 +86,7 @@ const MainLayout: React.FC<MainLayoutProps> = ({ children }) => {
         token: { colorBgContainer, borderRadiusLG },
     } = theme.useToken();
     const [collapsed, setCollapsed] = React.useState(false);
+    const [mobileSidebarOpen, setMobileSidebarOpen] = React.useState(false);
     const [checkingAuth, setCheckingAuth] = React.useState(true);
     const pathname = usePathname();
     const router = useRouter();
@@ -97,6 +98,10 @@ const MainLayout: React.FC<MainLayoutProps> = ({ children }) => {
     }, [pathname]);
 
     const isMindmapRoute = pathname === '/mindmap';
+
+    React.useEffect(() => {
+        setMobileSidebarOpen(false);
+    }, [pathname]);
 
     React.useEffect(() => {
         fetch('/api/auth/me', { cache: 'no-store' })
@@ -137,13 +142,14 @@ const MainLayout: React.FC<MainLayoutProps> = ({ children }) => {
                     </Link>
                 </div>
 
-                {/* <Button
+                <Button
                     type="text"
-                    icon={collapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
-                    onClick={() => setCollapsed((prev) => !prev)}
+                    icon={mobileSidebarOpen ? <MenuFoldOutlined /> : <MenuUnfoldOutlined />}
+                    onClick={() => setMobileSidebarOpen((prev) => !prev)}
                     className="app-sider-toggle"
-                    aria-label="Toggle sidebar"
-                /> */}
+                    aria-label={mobileSidebarOpen ? 'Close navigation' : 'Open navigation'}
+                    aria-expanded={mobileSidebarOpen}
+                />
 
                 <Menu
                     theme="light"
@@ -158,11 +164,12 @@ const MainLayout: React.FC<MainLayoutProps> = ({ children }) => {
 
             <Layout className="app-main-body">
                 <Sider
+                    className={`app-main-sider${mobileSidebarOpen ? ' app-main-sider-open' : ''}`}
                     width={220}
                     collapsedWidth={80}
                     breakpoint="lg"
                     collapsible
-                    collapsed={collapsed}
+                    collapsed={mobileSidebarOpen ? false : collapsed}
                     onCollapse={(value) => setCollapsed(value)}
                     style={{
                         background: colorBgContainer,
@@ -183,6 +190,14 @@ const MainLayout: React.FC<MainLayoutProps> = ({ children }) => {
                         items={sidebarMenuItems}
                     />
                 </Sider>
+                {mobileSidebarOpen && (
+                    <button
+                        type="button"
+                        className="app-mobile-sider-backdrop"
+                        aria-label="Close navigation"
+                        onClick={() => setMobileSidebarOpen(false)}
+                    />
+                )}
 
                 <Layout className="app-main-content-shell">
                     <Content

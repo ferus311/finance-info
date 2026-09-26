@@ -23,8 +23,13 @@
 }
 
 .app-sider-toggle {
+    display: none;
     margin-left: 8px;
     margin-right: 8px;
+}
+
+.app-mobile-sider-backdrop {
+    display: none;
 }
 
 .app-main-body {
@@ -112,5 +117,39 @@
 
     .app-top-nav {
         display: none;
+    }
+
+    .app-sider-toggle {
+        display: inline-flex;
+        flex: 0 0 auto;
+    }
+
+    .app-main-sider:not(.app-main-sider-open) {
+        display: none;
+    }
+
+    .app-main-sider.app-main-sider-open {
+        position: fixed;
+        z-index: 30;
+        top: 64px;
+        bottom: 0;
+        left: 0;
+        width: 220px !important;
+        max-width: 220px !important;
+        min-width: 220px !important;
+        height: calc(100vh - 64px);
+        flex: 0 0 220px !important;
+        box-shadow: 8px 0 24px rgba(16, 24, 40, 0.12);
+    }
+
+    .app-mobile-sider-backdrop {
+        position: fixed;
+        z-index: 20;
+        inset: 64px 0 0;
+        display: block;
+        width: 100%;
+        padding: 0;
+        border: 0;
+        background: rgba(16, 24, 40, 0.32);
     }
 }
