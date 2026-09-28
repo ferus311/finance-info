@@ -25,6 +25,14 @@ database.exec(`
         scenarios TEXT NOT NULL DEFAULT '[]',
         updated_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS vocabulary_entries (
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        target_language TEXT NOT NULL CHECK (target_language IN ('en', 'ja')),
+        id TEXT NOT NULL,
+        entry_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (user_id, target_language, id)
+    );
 `);
 
 type UserRow = { id: string; email: string; password_hash: string };
@@ -64,4 +72,53 @@ export function getUserData(userId: string) {
 
 export function updateUserData(userId: string, field: "watchlist" | "scenarios", value: unknown) {
     database.prepare(`UPDATE user_data SET ${field} = ?, updated_at = ? WHERE user_id = ?`).run(JSON.stringify(value), new Date().toISOString(), userId);
+}
+
+type VocabularyLanguage = "en" | "ja";
+type StoredVocabularyEntry = { id: string };
+
+export function getVocabularyEntries(userId: string, language: VocabularyLanguage) {
+    const rows = database.prepare(`
+        SELECT entry_json FROM vocabulary_entries
+        WHERE user_id = ? AND target_language = ?
+        ORDER BY created_at DESC, rowid DESC
+    `).all(userId, language) as Array<{ entry_json: string }>;
+    return rows.map((row) => JSON.parse(row.entry_json) as unknown);
+}
+
+export function addVocabularyEntries(
+    userId: string,
+    language: VocabularyLanguage,
+    entries: StoredVocabularyEntry[],
+) {
+    const insert = database.prepare(`
+        INSERT OR IGNORE INTO vocabulary_entries
+            (user_id, target_language, id, entry_json, created_at)
+        VALUES (?, ?, ?, ?, ?)
+    `);
+    const createdAt = new Date().toISOString();
+    const saveEntries = database.transaction((items: StoredVocabularyEntry[]) => {
+        for (const entry of [...items].reverse()) {
+            insert.run(userId, language, entry.id, JSON.stringify(entry), createdAt);
+        }
+    });
+    saveEntries(entries);
+}
+
+export function updateVocabularyEntry(
+    userId: string,
+    language: VocabularyLanguage,
+    entry: StoredVocabularyEntry,
+) {
+    return database.prepare(`
+        UPDATE vocabulary_entries SET entry_json = ?
+        WHERE user_id = ? AND target_language = ? AND id = ?
+    `).run(JSON.stringify(entry), userId, language, entry.id).changes > 0;
+}
+
+export function deleteVocabularyEntry(userId: string, language: VocabularyLanguage, id: string) {
+    return database.prepare(`
+        DELETE FROM vocabulary_entries
+        WHERE user_id = ? AND target_language = ? AND id = ?
+    `).run(userId, language, id).changes > 0;
 }

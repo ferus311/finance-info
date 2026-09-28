@@ -7,7 +7,6 @@ import {
     useState,
     type MouseEvent as ReactMouseEvent,
     type PointerEvent as ReactPointerEvent,
-    type WheelEvent as ReactWheelEvent,
 } from 'react';
 import { Manrope, Inter } from 'next/font/google';
 
@@ -156,6 +155,9 @@ export default function MindmapPage() {
     const containerRef = useRef<HTMLDivElement>(null);
     const contextMenuRef = useRef<HTMLDivElement>(null);
     const panRef = useRef({ panning: false });
+    const viewRef = useRef({ zoom: 1, pan: DEFAULT_PAN });
+    const touchPointersRef = useRef(new Map<number, { x: number; y: number }>());
+    const pinchRef = useRef<{ distance: number; centerX: number; centerY: number } | null>(null);
     const dragRef = useRef<{ type: 'move' | 'resize' | null, id: string | null, startX: number, startY: number, startW: number, startH: number }>({ type: null, id: null, startX: 0, startY: 0, startW: 0, startH: 0 });
     const nodesRef = useRef<MindNode[]>([]);
 
@@ -166,16 +168,29 @@ export default function MindmapPage() {
     useEffect(() => {
         const handleWindowWheel = (event: WheelEvent) => {
             const target = event.target as Node | null;
-            if (!containerRef.current || !target) return;
+            const rect = containerRef.current?.getBoundingClientRect();
+            if (!rect) return;
 
-            const isInsideBoard = containerRef.current.contains(target);
+            const isInsideBoard = Boolean(target && containerRef.current?.contains(target))
+                || (event.clientX >= rect.left && event.clientX <= rect.right
+                    && event.clientY >= rect.top && event.clientY <= rect.bottom);
             if (!isInsideBoard) return;
 
             event.preventDefault();
+            event.stopPropagation();
+
+            const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? 100 : 1;
+            if (event.deltaY !== 0) {
+                zoomAtPoint(event.clientX, event.clientY, viewRef.current.zoom * Math.exp(-event.deltaY * unit * 0.002));
+                return;
+            }
+
+            const { zoom: currentZoom, pan: currentPan } = viewRef.current;
+            setCanvasView(currentZoom, { x: currentPan.x - event.deltaX * unit, y: currentPan.y });
         };
 
-        window.addEventListener('wheel', handleWindowWheel, { passive: false });
-        return () => window.removeEventListener('wheel', handleWindowWheel);
+        window.addEventListener('wheel', handleWindowWheel, { capture: true, passive: false });
+        return () => window.removeEventListener('wheel', handleWindowWheel, true);
     }, [activeNotebookId]);
 
     const edges = useMemo(() => {
@@ -509,40 +524,114 @@ export default function MindmapPage() {
         dragRef.current.id = null;
     }
 
-    function handleBackgroundPointerDown(e: ReactPointerEvent<HTMLDivElement>) {
-        if (e.target !== e.currentTarget) return;
-        panRef.current.panning = true; (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId); setSelectedId(null);
+    function setCanvasView(nextZoom: number, nextPan: { x: number; y: number }) {
+        viewRef.current = { zoom: nextZoom, pan: nextPan };
+        setZoom(nextZoom);
+        setPan(nextPan);
     }
-    function handleBackgroundPointerMove(e: ReactPointerEvent<HTMLDivElement>) { if (panRef.current.panning) setPan((p) => ({ x: p.x + e.movementX, y: p.y + e.movementY })); }
-    function handleBackgroundPointerUp() { panRef.current.panning = false; }
 
-    function handleWheel(e: ReactWheelEvent<HTMLDivElement>) {
-        const isWithinBoard = !!containerRef.current && containerRef.current.contains(e.target as Node);
-        if (!isWithinBoard) return;
-
-        e.preventDefault();
-        e.stopPropagation();
-
+    function zoomAtPoint(clientX: number, clientY: number, nextZoom: number) {
         const rect = containerRef.current?.getBoundingClientRect();
         if (!rect) return;
 
-        const mouseX = e.clientX - rect.left;
-        const mouseY = e.clientY - rect.top;
-        const delta = -e.deltaY * 0.0014;
-
-        setZoom((prevZoom) => {
-            const nextZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, prevZoom * (1 + delta)));
-            const worldX = (mouseX - pan.x) / prevZoom;
-            const worldY = (mouseY - pan.y) / prevZoom;
-            setPan({
-                x: mouseX - worldX * nextZoom,
-                y: mouseY - worldY * nextZoom,
-            });
-            return nextZoom;
+        const { zoom: currentZoom, pan: currentPan } = viewRef.current;
+        const boundedZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, nextZoom));
+        const localX = clientX - rect.left;
+        const localY = clientY - rect.top;
+        const worldX = (localX - currentPan.x) / currentZoom;
+        const worldY = (localY - currentPan.y) / currentZoom;
+        setCanvasView(boundedZoom, {
+            x: localX - worldX * boundedZoom,
+            y: localY - worldY * boundedZoom,
         });
     }
 
-    function resetView() { setZoom(1); setPan(DEFAULT_PAN); }
+    function zoomBy(amount: number) {
+        const rect = containerRef.current?.getBoundingClientRect();
+        if (!rect) return;
+        zoomAtPoint(rect.left + rect.width / 2, rect.top + rect.height / 2, viewRef.current.zoom + amount);
+    }
+
+    function centerRoot(nextZoom = viewRef.current.zoom) {
+        const rect = containerRef.current?.getBoundingClientRect();
+        const root = nodes.find((node) => node.parentId === null);
+        if (!rect || !root) {
+            setCanvasView(nextZoom, DEFAULT_PAN);
+            return;
+        }
+
+        const element = document.getElementById(`node-${root.id}`);
+        const width = element?.offsetWidth ?? root.width ?? DEFAULT_W;
+        const height = element?.offsetHeight ?? root.height ?? DEFAULT_H;
+        setCanvasView(nextZoom, {
+            x: rect.width / 2 - (root.x + width / 2) * nextZoom,
+            y: rect.height / 2 - (root.y + height / 2) * nextZoom,
+        });
+    }
+
+    function handleCanvasPointerDown(e: ReactPointerEvent<HTMLDivElement>) {
+        if (e.pointerType !== 'touch' || editingId) return;
+        if (e.target instanceof HTMLElement && e.target.closest('[data-canvas-controls]')) return;
+
+        touchPointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+        if (touchPointersRef.current.size < 2) return;
+
+        const [first, second] = Array.from(touchPointersRef.current.values());
+        pinchRef.current = {
+            distance: Math.hypot(second.x - first.x, second.y - first.y),
+            centerX: (first.x + second.x) / 2,
+            centerY: (first.y + second.y) / 2,
+        };
+        panRef.current.panning = false;
+        dragRef.current.id = null;
+    }
+
+    function handleCanvasPointerMove(e: ReactPointerEvent<HTMLDivElement>) {
+        if (e.pointerType !== 'touch' || !touchPointersRef.current.has(e.pointerId)) return;
+        touchPointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+        if (!pinchRef.current || touchPointersRef.current.size < 2) return;
+
+        const [first, second] = Array.from(touchPointersRef.current.values());
+        const distance = Math.hypot(second.x - first.x, second.y - first.y);
+        const centerX = (first.x + second.x) / 2;
+        const centerY = (first.y + second.y) / 2;
+        const previous = pinchRef.current;
+        const rect = containerRef.current?.getBoundingClientRect();
+        if (!rect || previous.distance === 0) return;
+
+        const { zoom: currentZoom, pan: currentPan } = viewRef.current;
+        const nextZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, currentZoom * (distance / previous.distance)));
+        const previousLocalX = previous.centerX - rect.left;
+        const previousLocalY = previous.centerY - rect.top;
+        const worldX = (previousLocalX - currentPan.x) / currentZoom;
+        const worldY = (previousLocalY - currentPan.y) / currentZoom;
+        setCanvasView(nextZoom, {
+            x: centerX - rect.left - worldX * nextZoom,
+            y: centerY - rect.top - worldY * nextZoom,
+        });
+        pinchRef.current = { distance, centerX, centerY };
+    }
+
+    function handleCanvasPointerEnd(e: ReactPointerEvent<HTMLDivElement>) {
+        if (e.pointerType !== 'touch') return;
+        touchPointersRef.current.delete(e.pointerId);
+        if (touchPointersRef.current.size < 2) pinchRef.current = null;
+        if (touchPointersRef.current.size === 0) panRef.current.panning = false;
+    }
+
+    function handleBackgroundPointerDown(e: ReactPointerEvent<HTMLDivElement>) {
+        if (e.target !== e.currentTarget) return;
+        if (e.pointerType === 'touch' && touchPointersRef.current.size > 1) return;
+        panRef.current.panning = true; (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId); setSelectedId(null);
+    }
+    function handleBackgroundPointerMove(e: ReactPointerEvent<HTMLDivElement>) {
+        if (!panRef.current.panning) return;
+        const { zoom: currentZoom, pan: currentPan } = viewRef.current;
+        setCanvasView(currentZoom, { x: currentPan.x + e.movementX, y: currentPan.y + e.movementY });
+    }
+    function handleBackgroundPointerUp() { panRef.current.panning = false; }
+
+    function resetView() { centerRoot(1); }
 
     return (
         <div className={`${manrope.variable} ${inter.variable} flex h-screen w-screen overflow-hidden bg-[#FAFAFC]`} style={{ fontFamily: 'var(--font-ui)' }}>
@@ -584,7 +673,7 @@ export default function MindmapPage() {
 
             <main
                 ref={containerRef}
-                className="relative flex-1 overflow-hidden"
+                className="relative flex-1 overflow-hidden select-none"
                 style={{
                     height: '100%',
                     backgroundImage: 'linear-gradient(to right, #E4E4ED66 1px, transparent 1px), linear-gradient(to bottom, #E4E4ED66 1px, transparent 1px)',
@@ -595,13 +684,13 @@ export default function MindmapPage() {
                     overscrollBehavior: 'none',
                 }}
                 onContextMenu={(e) => e.preventDefault()}
-                onPointerDown={(e: ReactPointerEvent<HTMLDivElement>) => { setBoardActive(true); handleBackgroundPointerDown(e); }}
-                onPointerMove={(e: ReactPointerEvent<HTMLDivElement>) => { setBoardActive(true); handleBackgroundPointerMove(e); }}
-                onPointerUp={() => { setBoardActive(true); handleBackgroundPointerUp(); }}
+                onPointerDown={(e: ReactPointerEvent<HTMLDivElement>) => { setBoardActive(true); handleCanvasPointerDown(e); handleBackgroundPointerDown(e); }}
+                onPointerMove={(e: ReactPointerEvent<HTMLDivElement>) => { setBoardActive(true); handleCanvasPointerMove(e); handleBackgroundPointerMove(e); }}
+                onPointerUp={(e: ReactPointerEvent<HTMLDivElement>) => { setBoardActive(true); handleCanvasPointerEnd(e); handleBackgroundPointerUp(); }}
+                onPointerCancel={(e: ReactPointerEvent<HTMLDivElement>) => { handleCanvasPointerEnd(e); handleBackgroundPointerUp(); }}
                 onPointerLeave={() => { setBoardActive(false); handleBackgroundPointerUp(); }}
                 onMouseEnter={() => setBoardActive(true)}
                 onMouseLeave={() => setBoardActive(false)}
-                onWheel={handleWheel}
             >
                 <div className="absolute left-6 top-6 z-10 flex items-center gap-2">
                     <button onClick={() => setIsSidebarOpen(v => !v)} className="flex h-10 w-10 items-center justify-center rounded-xl bg-white border border-[#E4E4ED] shadow-sm text-[#4B4A5C] hover:bg-[#F2F1FA] transition-colors">
@@ -624,9 +713,18 @@ export default function MindmapPage() {
                         </button>
                     </label>
                     <div className="flex h-10 items-center gap-1 rounded-xl bg-white border border-[#E4E4ED] px-2 shadow-sm text-[#4B4A5C]">
-                        <button onClick={() => setZoom((z) => Math.max(MIN_ZOOM, +(z - 0.1).toFixed(2)))} className="flex h-7 w-7 items-center justify-center rounded-lg text-base font-medium hover:bg-[#F2F1FA]">−</button>
-                        <button onClick={resetView} className="min-w-[46px] text-center text-xs font-bold text-[#8A8A9A] hover:text-[#4B4A5C]">{Math.round(zoom * 100)}%</button>
-                        <button onClick={() => setZoom((z) => Math.min(MAX_ZOOM, +(z + 0.1).toFixed(2)))} className="flex h-7 w-7 items-center justify-center rounded-lg text-base font-medium hover:bg-[#F2F1FA]">+</button>
+                        <button onClick={() => zoomBy(-0.1)} className="flex h-7 w-7 items-center justify-center rounded-lg text-base font-medium hover:bg-[#F2F1FA]">−</button>
+                        <span className="min-w-[46px] text-center text-xs font-bold text-[#8A8A9A]">{Math.round(zoom * 100)}%</span>
+                        <button
+                            onClick={resetView}
+                            disabled={!nodes.some((node) => node.parentId === null)}
+                            aria-label="Center on root node"
+                            title="Center on root node"
+                            className="flex h-7 w-7 items-center justify-center rounded-lg text-[#4B4A5C] hover:bg-[#F2F1FA] disabled:cursor-not-allowed disabled:opacity-40"
+                        >
+                            <CenterIcon />
+                        </button>
+                        <button onClick={() => zoomBy(0.1)} className="flex h-7 w-7 items-center justify-center rounded-lg text-base font-medium hover:bg-[#F2F1FA]">+</button>
                     </div>
                 </div>
 
@@ -691,7 +789,7 @@ export default function MindmapPage() {
                                                     }
                                                 }}
                                                 className={`w-full bg-transparent text-[15px] font-semibold outline-none text-center resize-none overflow-hidden ${isRoot && !node.color ? 'text-white' : 'text-[#201F2E]'}`}
-                                                style={{ minHeight: '40px', fieldSizing: 'content' } as React.CSSProperties}
+                                                style={{ minHeight: '40px', fieldSizing: 'content', userSelect: 'text' } as React.CSSProperties}
                                             />
                                         ) : (
                                             <p className="whitespace-pre-wrap break-words text-[15px] font-semibold text-center w-full leading-snug" style={{ fontFamily: 'var(--font-display)', color: isRoot && !node.color ? 'white' : '#201F2E' }}>
@@ -765,4 +863,8 @@ function XIcon() {
 
 function SparkleIcon() {
     return <svg viewBox="0 0 24 24" fill="currentColor" className="h-3.5 w-3.5"><path d="M12 2l1.8 5.2L19 9l-5.2 1.8L12 16l-1.8-5.2L5 9l5.2-1.8L12 2z" /></svg>;
+}
+
+function CenterIcon() {
+    return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4"><circle cx="12" cy="12" r="3" /><path d="M12 2v3m0 14v3M2 12h3m14 0h3" /></svg>;
 }

@@ -41,6 +41,7 @@ const appNavigationGroups: AppMenuGroup[] = [
         items: [
             { key: '/dictation', label: 'Dictation', href: '/dictation', icon: <FileTextOutlined /> },
             { key: '/mindmap', label: 'Mindmap', href: '/mindmap', icon: <BookOutlined /> },
+            { key: '/vocabulary', label: 'Vocabulary', href: '/vocabulary', icon: <BookOutlined /> },
         ],
     },
     {
