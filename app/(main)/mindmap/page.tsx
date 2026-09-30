@@ -5,7 +5,6 @@ import {
     useMemo,
     useRef,
     useState,
-    type MouseEvent as ReactMouseEvent,
     type PointerEvent as ReactPointerEvent,
 } from 'react';
 import { Manrope, Inter } from 'next/font/google';
@@ -15,7 +14,10 @@ const inter = Inter({ subsets: ['latin'], weight: ['400', '500', '600'], variabl
 
 const API_BASE = '/api/mindmap';
 
-type Notebook = { id: string; title: string };
+type Notebook = { id: string; title: string; groupName: string; sortOrder: number };
+type NotebookGroup = { name: string; sortOrder: number };
+type SidebarDrag = { kind: 'notebook' | 'group'; id: string };
+type SidebarDrop = { kind: 'notebook' | 'group'; id: string; position: 'before' | 'after' | 'inside' };
 
 type MindNode = {
     id: string; notebookId: string; parentId: string | null;
@@ -131,13 +133,29 @@ function collectSubtreeIds(nodes: MindNode[], rootId: string): Set<string> {
     return ids;
 }
 
+function getVisibleNodes(nodes: MindNode[], collapsedIds: Set<string>) {
+    const byId = new Map(nodes.map((node) => [node.id, node]));
+    return nodes.filter((node) => {
+        let parentId = node.parentId;
+        while (parentId) {
+            if (collapsedIds.has(parentId)) return false;
+            parentId = byId.get(parentId)?.parentId ?? null;
+        }
+        return true;
+    });
+}
+
 export default function MindmapPage() {
     const [notebooks, setNotebooks] = useState<Notebook[]>([]);
+    const [notebookGroups, setNotebookGroups] = useState<NotebookGroup[]>([]);
+    const [collapsedNotebookGroups, setCollapsedNotebookGroups] = useState<Set<string>>(new Set());
     const [activeNotebookId, setActiveNotebookId] = useState<string | null>(null);
     const [loadingNotebooks, setLoadingNotebooks] = useState(true);
     const [loadingNodes, setLoadingNodes] = useState(false);
     const [isCreatingNotebook, setIsCreatingNotebook] = useState(false);
     const [editingNotebookId, setEditingNotebookId] = useState<string | null>(null);
+    const [sidebarDrag, setSidebarDrag] = useState<SidebarDrag | null>(null);
+    const [sidebarDrop, setSidebarDrop] = useState<SidebarDrop | null>(null);
     const [isSidebarOpen, setIsSidebarOpen] = useState(true);
     const [recentlyDeletedNotebook, setRecentlyDeletedNotebook] = useState<Notebook | null>(null);
 
@@ -149,8 +167,10 @@ export default function MindmapPage() {
 
     const [zoom, setZoom] = useState(1);
     const [pan, setPan] = useState(DEFAULT_PAN);
-    const [autoArrange, setAutoArrange] = useState(true);
+    const [autoFormat, setAutoFormat] = useState(true);
     const [boardActive, setBoardActive] = useState(false);
+    const [collapsedNodeIds, setCollapsedNodeIds] = useState<Set<string>>(new Set());
+    const [dropTargetId, setDropTargetId] = useState<string | null>(null);
 
     const containerRef = useRef<HTMLDivElement>(null);
     const contextMenuRef = useRef<HTMLDivElement>(null);
@@ -166,6 +186,21 @@ export default function MindmapPage() {
     }, [nodes]);
 
     useEffect(() => {
+        try {
+            const savedGroups = JSON.parse(window.localStorage.getItem('mindmap-collapsed-groups') || '[]');
+            if (Array.isArray(savedGroups)) {
+                setCollapsedNotebookGroups(new Set(savedGroups.filter((name): name is string => typeof name === 'string')));
+            }
+        } catch { }
+    }, []);
+
+    useEffect(() => {
+        if (!recentlyDeletedNotebook) return;
+        const timeoutId = window.setTimeout(() => setRecentlyDeletedNotebook(null), 6000);
+        return () => window.clearTimeout(timeoutId);
+    }, [recentlyDeletedNotebook]);
+
+    useEffect(() => {
         const handleWindowWheel = (event: WheelEvent) => {
             const target = event.target as Node | null;
             const rect = containerRef.current?.getBoundingClientRect();
@@ -178,6 +213,7 @@ export default function MindmapPage() {
 
             event.preventDefault();
             event.stopPropagation();
+            if (target instanceof HTMLElement && target.closest('[data-canvas-controls]')) return;
 
             const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? 100 : 1;
             if (event.deltaY !== 0) {
@@ -193,8 +229,10 @@ export default function MindmapPage() {
         return () => window.removeEventListener('wheel', handleWindowWheel, true);
     }, [activeNotebookId]);
 
+    const visibleNodes = getVisibleNodes(nodes, collapsedNodeIds);
     const edges = useMemo(() => {
-        return nodes.filter((n) => n.parentId).map((n) => {
+        const visibleIds = new Set(visibleNodes.map((node) => node.id));
+        return visibleNodes.filter((n) => n.parentId && visibleIds.has(n.parentId)).map((n) => {
             const parent = nodes.find((p) => p.id === n.parentId);
             if (!parent) return null;
 
@@ -215,15 +253,18 @@ export default function MindmapPage() {
             const mx = x1 + (x2 - x1) / 2;
             return { id: n.id, d: `M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}` };
         }).filter((e): e is { id: string; d: string } => e !== null);
-    }, [nodes]);
+    }, [nodes, collapsedNodeIds]);
 
     useEffect(() => {
         (async () => {
             setLoadingNotebooks(true);
             try {
                 const data = await apiFetch(`${API_BASE}?resource=notebooks`);
-                const mapped: Notebook[] = (data.notebooks as { id: string; title: string }[]).map((n) => ({ id: n.id, title: n.title }));
+                const mapped: Notebook[] = (data.notebooks as { id: string; title: string; group_name?: string; sort_order?: number }[]).map((n) => ({
+                    id: n.id, title: n.title, groupName: n.group_name || '', sortOrder: n.sort_order || 0,
+                }));
                 setNotebooks(mapped);
+                setNotebookGroups((data.groups as { name: string; sort_order: number }[] || []).map((group) => ({ name: group.name, sortOrder: group.sort_order })));
                 if (mapped.length > 0) setActiveNotebookId(mapped[0].id);
             } catch { setError('Could not load notebooks.'); } finally { setLoadingNotebooks(false); }
         })();
@@ -356,13 +397,105 @@ export default function MindmapPage() {
         const id = createStableId(), rootId = createStableId(), cleanTitle = title.trim() || 'Untitled notebook';
         try {
             await apiFetch(`${API_BASE}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ resource: 'notebook', id, title: cleanTitle, rootId }) });
-            setNotebooks((prev) => [...prev, { id, title: cleanTitle }]);
+            setNotebooks((prev) => [...prev, { id, title: cleanTitle, groupName: '', sortOrder: prev.filter((item) => !item.groupName).length }]);
             setActiveNotebookId(id);
             setNodes([{ id: rootId, notebookId: id, parentId: null, text: 'Central idea', x: 0, y: 0, type: 'text', width: DEFAULT_W, height: DEFAULT_H, imageUrl: null, preserveAspect: true, color: null }]);
             setPan(DEFAULT_PAN); setZoom(1);
         } catch {
             setError('Could not create this notebook.');
         }
+    }
+
+    async function createNotebookGroup() {
+        const name = window.prompt('New group name')?.trim().slice(0, 80);
+        if (!name || notebookGroups.some((group) => group.name.toLocaleLowerCase() === name.toLocaleLowerCase())) return;
+        const group = { name, sortOrder: notebookGroups.length };
+        try {
+            await apiFetch(`${API_BASE}`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ resource: 'group', name }),
+            });
+            setNotebookGroups((prev) => [...prev, group]);
+        } catch {
+            setError('Could not create this group.');
+        }
+    }
+
+    function toggleNotebookGroup(name: string) {
+        setCollapsedNotebookGroups((previous) => {
+            const next = new Set(previous);
+            if (next.has(name)) next.delete(name);
+            else next.add(name);
+            window.localStorage.setItem('mindmap-collapsed-groups', JSON.stringify([...next]));
+            return next;
+        });
+    }
+
+    async function deleteNotebookGroup(name: string, notebookCount: number) {
+        if (!window.confirm(`Delete group "${name}" and all ${notebookCount} notebooks in it? This cannot be undone.`)) return;
+
+        try {
+            await apiFetch(`${API_BASE}?resource=group&name=${encodeURIComponent(name)}`, { method: 'DELETE' });
+            const removedIds = new Set(notebooks.filter((notebook) => notebook.groupName === name).map((notebook) => notebook.id));
+            const remaining = notebooks.filter((notebook) => notebook.groupName !== name);
+            setNotebooks(remaining);
+            setNotebookGroups((previous) => previous.filter((group) => group.name !== name));
+            setCollapsedNotebookGroups((previous) => {
+                const next = new Set(previous);
+                next.delete(name);
+                window.localStorage.setItem('mindmap-collapsed-groups', JSON.stringify([...next]));
+                return next;
+            });
+            if (activeNotebookId && removedIds.has(activeNotebookId)) setActiveNotebookId(remaining[0]?.id ?? null);
+        } catch {
+            setError('Could not delete this group.');
+        }
+    }
+
+    function saveNotebookArrangement(updated: Notebook[]) {
+        setNotebooks(updated);
+        void apiFetch(`${API_BASE}`, {
+            method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ resource: 'notebook', action: 'reorder', notebooks: updated.map(({ id, sortOrder, groupName }) => ({ id, sortOrder, groupName })) }),
+        }).catch(() => setError('Could not save notebook order.'));
+    }
+
+    function moveNotebookTo(id: string, groupName: string, targetId: string | null, position: 'before' | 'after' | 'inside') {
+        const source = notebooks.find((item) => item.id === id);
+        if (!source) return;
+
+        const sourceItems = notebooks.filter((item) => item.groupName === source.groupName).sort((a, b) => a.sortOrder - b.sortOrder);
+        const destinationItems = source.groupName === groupName
+            ? sourceItems
+            : notebooks.filter((item) => item.groupName === groupName).sort((a, b) => a.sortOrder - b.sortOrder);
+        const sourceWithout = sourceItems.filter((item) => item.id !== id);
+        const targetIndex = targetId ? destinationItems.filter((item) => item.id !== id).findIndex((item) => item.id === targetId) : -1;
+        const destinationWithout = destinationItems.filter((item) => item.id !== id);
+        const insertAt = targetIndex < 0 ? destinationWithout.length : targetIndex + (position === 'after' ? 1 : 0);
+        destinationWithout.splice(insertAt, 0, { ...source, groupName });
+
+        const updatedById = new Map<string, Notebook>();
+        if (source.groupName !== groupName) sourceWithout.forEach((item, index) => updatedById.set(item.id, { ...item, sortOrder: index }));
+        destinationWithout.forEach((item, index) => updatedById.set(item.id, { ...item, groupName, sortOrder: index }));
+        const updated = notebooks.map((item) => updatedById.get(item.id) ?? item);
+        if (updated.some((item, index) => item.groupName !== notebooks[index].groupName || item.sortOrder !== notebooks[index].sortOrder)) {
+            saveNotebookArrangement(updated);
+        }
+    }
+
+    function reorderNotebookGroup(id: string, targetId: string, position: 'before' | 'after') {
+        if (id === targetId) return;
+        const ordered = [...notebookGroups].sort((a, b) => a.sortOrder - b.sortOrder);
+        const sourceIndex = ordered.findIndex((group) => group.name === id);
+        const [source] = ordered.splice(sourceIndex, 1);
+        const targetIndex = ordered.findIndex((group) => group.name === targetId);
+        ordered.splice(targetIndex + (position === 'after' ? 1 : 0), 0, source);
+        const updated = ordered.map((group, sortOrder) => ({ ...group, sortOrder }));
+        setNotebookGroups(updated);
+        void apiFetch(`${API_BASE}`, {
+            method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ resource: 'group', action: 'reorder', groups: updated }),
+        }).catch(() => setError('Could not save group order.'));
     }
 
     function renameNotebook(id: string, title: string) {
@@ -407,6 +540,9 @@ export default function MindmapPage() {
         if (!activeNotebookId) return;
 
         const newNodeId = createStableId();
+        const nextCollapsedIds = new Set(collapsedNodeIds);
+        if (parentId) nextCollapsedIds.delete(parentId);
+        if (nextCollapsedIds.size !== collapsedNodeIds.size) setCollapsedNodeIds(nextCollapsedIds);
 
         setNodes(prevNodes => {
             const parent = parentId ? prevNodes.find(n => n.id === parentId) : null;
@@ -426,12 +562,12 @@ export default function MindmapPage() {
             };
 
             const updatedNodes = [...prevNodes, newNode];
-            const laidOut = parentId ? layoutTree(updatedNodes) : updatedNodes;
+            const laidOut = autoFormat ? formatVisibleTree(updatedNodes, nextCollapsedIds) : updatedNodes;
 
             apiFetch(`${API_BASE}`, {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ resource: 'node', ...newNode, imageUrl, preserveAspect: 1 })
-            }).then(() => { if (parentId) persistPositions(laidOut); }).catch(() => setError('Could not save this node.'));
+            }).then(() => { if (autoFormat) persistPositions(laidOut); }).catch(() => setError('Could not save this node.'));
 
             return laidOut;
         });
@@ -443,10 +579,12 @@ export default function MindmapPage() {
     function deleteNode(id: string) {
         const toRemove = collectSubtreeIds(nodes, id);
         setNodes(prev => {
-            const laidOut = layoutTree(prev.filter((n) => !toRemove.has(n.id)));
+            const remaining = prev.filter((n) => !toRemove.has(n.id));
+            const laidOut = autoFormat ? formatVisibleTree(remaining, collapsedNodeIds) : remaining;
             persistPositions(laidOut);
             return laidOut;
         });
+        setCollapsedNodeIds((prev) => new Set([...prev].filter((nodeId) => !toRemove.has(nodeId))));
         if (selectedId && toRemove.has(selectedId)) setSelectedId(null);
         apiFetch(`${API_BASE}?resource=node&id=${id}`, { method: 'DELETE' });
     }
@@ -457,8 +595,36 @@ export default function MindmapPage() {
     }
 
     function rearrangeAll() {
-        const laidOut = layoutTree(nodes);
+        const laidOut = formatVisibleTree(nodes, collapsedNodeIds);
         setNodes(laidOut); persistPositions(laidOut);
+    }
+
+    function formatVisibleTree(list: MindNode[], collapsedIds: Set<string>) {
+        const visible = getVisibleNodes(list, collapsedIds);
+        const positions = new Map(layoutTree(visible).map((node) => [node.id, { x: node.x, y: node.y }]));
+        return list.map((node) => {
+            const position = positions.get(node.id);
+            return position ? { ...node, ...position } : node;
+        });
+    }
+
+    function toggleChildren(nodeId: string) {
+        const nextCollapsedIds = new Set(collapsedNodeIds);
+        if (nextCollapsedIds.has(nodeId)) nextCollapsedIds.delete(nodeId);
+        else nextCollapsedIds.add(nodeId);
+        setCollapsedNodeIds(nextCollapsedIds);
+        if (autoFormat) {
+            const laidOut = formatVisibleTree(nodes, nextCollapsedIds);
+            setNodes(laidOut);
+            persistPositions(laidOut);
+        }
+    }
+
+    function getDropTarget(clientX: number, clientY: number, draggedId: string) {
+        const element = document.elementFromPoint(clientX, clientY)?.closest<HTMLElement>('[data-node-id]');
+        const targetId = element?.dataset.nodeId;
+        if (!targetId || targetId === draggedId || collectSubtreeIds(nodesRef.current, draggedId).has(targetId)) return null;
+        return targetId;
     }
 
     // Drag & Resize Handlers
@@ -469,7 +635,8 @@ export default function MindmapPage() {
     }
 
     function handleResizePointerDown(e: ReactPointerEvent, node: MindNode) {
-        e.stopPropagation(); (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+        e.stopPropagation();
+        (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
         const el = document.getElementById(`node-${node.id}`);
         dragRef.current = { type: 'resize', id: node.id, startX: e.clientX, startY: e.clientY, startW: el ? el.offsetWidth : node.width, startH: el ? el.offsetHeight : node.height };
         setSelectedId(node.id);
@@ -480,10 +647,11 @@ export default function MindmapPage() {
         if (!id) return;
 
         if (type === 'move') {
+            setDropTargetId(getDropTarget(e.clientX, e.clientY, id));
             const dx = e.movementX / zoom;
             const dy = e.movementY / zoom;
             setNodes(prev => {
-                if (!autoArrange) {
+                if (!autoFormat) {
                     return prev.map(n => n.id === id ? { ...n, x: n.x + dx, y: n.y + dy } : n);
                 }
 
@@ -505,10 +673,12 @@ export default function MindmapPage() {
         }
     }
 
-    function handlePointerUp() {
+    function handlePointerUp(e: ReactPointerEvent<HTMLDivElement>) {
         const { id, type } = dragRef.current;
         if (id) {
-            const liveNode = nodesRef.current.find(n => n.id === id);
+            const targetId = type === 'move' ? getDropTarget(e.clientX, e.clientY, id) : null;
+            const liveNodes = nodesRef.current;
+            const liveNode = liveNodes.find(n => n.id === id);
             if (!liveNode) {
                 dragRef.current.id = null;
                 return;
@@ -517,11 +687,25 @@ export default function MindmapPage() {
             if (type === 'resize') {
                 updateNodeProps(id, { width: liveNode.width, height: liveNode.height });
             } else {
-                const movedIds = autoArrange ? collectSubtreeIds(nodesRef.current, id) : new Set([id]);
-                persistPositions(nodesRef.current.filter(n => movedIds.has(n.id)));
+                const parentChanged = Boolean(targetId && targetId !== liveNode.parentId);
+                const reparented = parentChanged
+                    ? liveNodes.map((node) => node.id === id ? { ...node, parentId: targetId! } : node)
+                    : liveNodes;
+                const nextNodes = autoFormat ? formatVisibleTree(reparented, collapsedNodeIds) : reparented;
+                setNodes(nextNodes);
+                if (parentChanged) {
+                    const movedNode = nextNodes.find((node) => node.id === id)!;
+                    void apiFetch(`${API_BASE}`, {
+                        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ resource: 'node', id, parentId: targetId, x: movedNode.x, y: movedNode.y }),
+                    }).catch(() => setError('Could not change this node parent.'));
+                }
+                const movedIds = autoFormat ? new Set(nextNodes.map((node) => node.id)) : parentChanged ? new Set([id]) : collectSubtreeIds(nextNodes, id);
+                persistPositions(nextNodes.filter((node) => movedIds.has(node.id)));
             }
         }
         dragRef.current.id = null;
+        setDropTargetId(null);
     }
 
     function setCanvasView(nextZoom: number, nextPan: { x: number; y: number }) {
@@ -633,39 +817,173 @@ export default function MindmapPage() {
 
     function resetView() { centerRoot(1); }
 
+    const groupedNotebooks = [
+        ...[...notebookGroups].sort((a, b) => a.sortOrder - b.sortOrder).map(({ name: groupName }) => ({
+            groupName,
+            notebooks: notebooks.filter((notebook) => notebook.groupName === groupName).sort((a, b) => a.sortOrder - b.sortOrder),
+        })),
+        {
+            groupName: '',
+            notebooks: notebooks.filter((notebook) => !notebook.groupName).sort((a, b) => a.sortOrder - b.sortOrder),
+        },
+    ];
+
     return (
-        <div className={`${manrope.variable} ${inter.variable} flex h-screen w-screen overflow-hidden bg-[#FAFAFC]`} style={{ fontFamily: 'var(--font-ui)' }}>
+        <div className={`${manrope.variable} ${inter.variable} flex h-full min-h-0 w-full min-w-0 overflow-hidden bg-[#FAFAFC]`} style={{ fontFamily: 'var(--font-ui)' }}>
 
             <div className={`transition-[width] duration-300 ease-in-out flex-shrink-0 z-20 ${isSidebarOpen ? 'w-64' : 'w-0'}`} style={{ overflow: 'hidden' }}>
                 <aside className="w-64 flex h-full flex-col border-r border-[#E4E4ED] bg-white">
-                    <div className="flex items-center justify-between border-b border-[#EEEDF6] px-4 py-4">
+                    <div className="flex items-center justify-between border-b border-[#EEEDF6] px-3 py-3">
                         <div className="flex items-center gap-2">
-                            <span className="h-2.5 w-2.5 rounded-full bg-[#7B61FF]" />
-                            <span className="text-sm font-bold tracking-tight text-[#201F2E]" style={{ fontFamily: 'var(--font-display)' }}>
-                                Notebooks
-                            </span>
+                            <FolderIcon />
+                            <span className="text-sm font-bold tracking-tight text-[#201F2E]" style={{ fontFamily: 'var(--font-display)' }}>Notebooks</span>
                         </div>
-                        <button onClick={() => setIsCreatingNotebook(true)} className="flex h-6 w-6 items-center justify-center rounded-lg text-[#7B61FF] hover:bg-[#F2F1FA]">
-                            <PlusIcon />
-                        </button>
+                        <div className="flex items-center gap-1">
+                            <button onClick={createNotebookGroup} aria-label="Create group" title="New group" className="flex h-8 w-8 items-center justify-center rounded-lg text-[#626174] hover:bg-[#F2F1FA] hover:text-[#4B33E0]">
+                                <FolderPlusIcon />
+                            </button>
+                            <button onClick={() => setIsCreatingNotebook(true)} aria-label="Create notebook" title="New notebook" className="flex h-8 w-8 items-center justify-center rounded-lg text-[#626174] hover:bg-[#F2F1FA] hover:text-[#4B33E0]">
+                                <NotebookPlusIcon />
+                            </button>
+                        </div>
                     </div>
 
-                    <div className="flex-1 overflow-y-auto px-2 py-2">
+                    <div className="flex-1 overflow-y-auto px-2 py-3">
                         {loadingNotebooks && <p className="px-2 py-2 text-xs text-[#A5A4B5]">Loading notebooks…</p>}
                         {isCreatingNotebook && (
                             <NotebookInputRow autoFocus placeholder="Subject name…" onSubmit={(title) => { if (title.trim()) createNotebook(title); setIsCreatingNotebook(false); }} onCancel={() => setIsCreatingNotebook(false)} />
                         )}
-                        {notebooks.map((nb) => (
-                            <div key={nb.id} className={['group mb-1 flex items-center justify-between rounded-xl px-3 py-2 text-sm transition-colors', nb.id === activeNotebookId ? 'bg-[#EFECFF] text-[#4B33E0]' : 'text-[#4B4A5C] hover:bg-[#F7F7FB]',].join(' ')}>
-                                {editingNotebookId === nb.id ? (
-                                    <NotebookInputRow autoFocus defaultValue={nb.title} onSubmit={(title) => { renameNotebook(nb.id, title); setEditingNotebookId(null); }} onCancel={() => setEditingNotebookId(null)} />
-                                ) : (
-                                    <>
-                                        <button onClick={() => setActiveNotebookId(nb.id)} onDoubleClick={() => setEditingNotebookId(nb.id)} className="flex-1 truncate text-left font-medium">{nb.title}</button>
-                                        <button onClick={() => deleteNotebook(nb.id)} className="ml-2 flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full text-[#B9B8C6] opacity-0 transition-opacity group-hover:opacity-100 hover:text-[#E5484D]"><XIcon /></button>
-                                    </>
-                                )}
-                            </div>
+                        {groupedNotebooks.map(({ groupName, notebooks: groupItems }) => (
+                            <section
+                                key={groupName || 'ungrouped'}
+                                className="mb-2"
+                                onDragOver={(event) => {
+                                    if (sidebarDrag?.kind !== 'notebook') return;
+                                    event.preventDefault();
+                                    setSidebarDrop({ kind: 'group', id: groupName, position: 'inside' });
+                                }}
+                                onDrop={(event) => {
+                                    if (sidebarDrag?.kind !== 'notebook') return;
+                                    event.preventDefault();
+                                    moveNotebookTo(sidebarDrag.id, groupName, null, 'inside');
+                                    setSidebarDrag(null);
+                                    setSidebarDrop(null);
+                                }}
+                            >
+                                <div
+                                    draggable={Boolean(groupName)}
+                                    onDragStart={(event) => {
+                                        if (!groupName) return;
+                                        event.dataTransfer.effectAllowed = 'move';
+                                        setSidebarDrag({ kind: 'group', id: groupName });
+                                    }}
+                                    onDragOver={(event) => {
+                                        event.stopPropagation();
+                                        event.preventDefault();
+                                        if (sidebarDrag?.kind === 'notebook') {
+                                            setSidebarDrop({ kind: 'group', id: groupName, position: 'inside' });
+                                        } else if (sidebarDrag?.kind === 'group' && groupName && sidebarDrag.id !== groupName) {
+                                            const bounds = event.currentTarget.getBoundingClientRect();
+                                            setSidebarDrop({ kind: 'group', id: groupName, position: event.clientY < bounds.top + bounds.height / 2 ? 'before' : 'after' });
+                                        }
+                                    }}
+                                    onDrop={(event) => {
+                                        event.preventDefault();
+                                        event.stopPropagation();
+                                        if (!sidebarDrag) return;
+                                        if (sidebarDrag.kind === 'notebook') {
+                                            moveNotebookTo(sidebarDrag.id, groupName, null, 'inside');
+                                        } else if (groupName && sidebarDrop?.kind === 'group') {
+                                            reorderNotebookGroup(sidebarDrag.id, groupName, sidebarDrop.position === 'after' ? 'after' : 'before');
+                                        }
+                                        setSidebarDrag(null);
+                                        setSidebarDrop(null);
+                                    }}
+                                    className={[
+                                        'mb-1 flex h-9 items-center gap-2 rounded-lg px-2 text-xs font-semibold transition-colors',
+                                        groupName ? 'cursor-grab text-[#777687] hover:bg-[#F7F7FB]' : 'text-[#A5A4B5]',
+                                        sidebarDrop?.kind === 'group' && sidebarDrop.id === groupName && sidebarDrop.position === 'inside' ? 'bg-emerald-50 text-emerald-800 ring-1 ring-emerald-300' : '',
+                                        sidebarDrop?.kind === 'group' && sidebarDrop.id === groupName && sidebarDrop.position === 'before' ? 'border-t-2 border-emerald-500' : '',
+                                        sidebarDrop?.kind === 'group' && sidebarDrop.id === groupName && sidebarDrop.position === 'after' ? 'border-b-2 border-emerald-500' : '',
+                                    ].join(' ')}
+                                >
+                                    <FolderIcon />
+                                    <span className="min-w-0 flex-1 truncate">{groupName || 'Ungrouped'}</span>
+                                    <span className="text-[10px] font-medium text-[#A5A4B5]">{groupItems.length}</span>
+                                    {groupName && (
+                                        <button
+                                            type="button"
+                                            draggable={false}
+                                            onPointerDown={(event) => event.stopPropagation()}
+                                            onClick={(event) => { event.stopPropagation(); void deleteNotebookGroup(groupName, groupItems.length); }}
+                                            aria-label={`Delete ${groupName} group and its notebooks`}
+                                            title="Delete group and notebooks"
+                                            className="flex h-6 w-6 flex-shrink-0 items-center justify-center rounded-md text-[#A5A4B5] hover:bg-rose-50 hover:text-[#E5484D]"
+                                        >
+                                            <XIcon />
+                                        </button>
+                                    )}
+                                    <button
+                                        type="button"
+                                        draggable={false}
+                                        onPointerDown={(event) => event.stopPropagation()}
+                                        onClick={(event) => { event.stopPropagation(); toggleNotebookGroup(groupName); }}
+                                        aria-label={`${collapsedNotebookGroups.has(groupName) ? 'Expand' : 'Collapse'} ${groupName || 'Ungrouped'} group`}
+                                        aria-expanded={!collapsedNotebookGroups.has(groupName)}
+                                        title={collapsedNotebookGroups.has(groupName) ? 'Expand group' : 'Collapse group'}
+                                        className="flex h-6 w-6 flex-shrink-0 items-center justify-center rounded-md text-[#777687] hover:bg-[#F2F1FA]"
+                                    >
+                                        <ChevronIcon collapsed={collapsedNotebookGroups.has(groupName)} />
+                                    </button>
+                                </div>
+                                {!collapsedNotebookGroups.has(groupName) && <div className="space-y-0.5 pl-2">
+                                    {groupItems.map((nb) => (
+                                        <div
+                                            key={nb.id}
+                                            draggable={editingNotebookId !== nb.id}
+                                            onDragStart={(event) => {
+                                                event.dataTransfer.effectAllowed = 'move';
+                                                setSidebarDrag({ kind: 'notebook', id: nb.id });
+                                            }}
+                                            onDragOver={(event) => {
+                                                if (!sidebarDrag || sidebarDrag.id === nb.id) return;
+                                                event.preventDefault();
+                                                const bounds = event.currentTarget.getBoundingClientRect();
+                                                const position = event.clientY < bounds.top + bounds.height / 2 ? 'before' : 'after';
+                                                setSidebarDrop(sidebarDrag.kind === 'group'
+                                                    ? { kind: 'group', id: nb.groupName, position }
+                                                    : { kind: 'notebook', id: nb.id, position });
+                                            }}
+                                            onDrop={(event) => {
+                                                event.preventDefault();
+                                                event.stopPropagation();
+                                                if (sidebarDrag?.kind === 'notebook') moveNotebookTo(sidebarDrag.id, nb.groupName, nb.id, sidebarDrop?.position === 'after' ? 'after' : 'before');
+                                                else if (sidebarDrag?.kind === 'group' && nb.groupName) reorderNotebookGroup(sidebarDrag.id, nb.groupName, sidebarDrop?.position === 'after' ? 'after' : 'before');
+                                                setSidebarDrag(null);
+                                                setSidebarDrop(null);
+                                            }}
+                                            onDragEnd={() => { setSidebarDrag(null); setSidebarDrop(null); }}
+                                            className={[
+                                                'group/notebook relative flex min-w-0 items-center rounded-lg text-sm transition-colors',
+                                                nb.id === activeNotebookId ? 'bg-[#EFECFF] text-[#4B33E0]' : 'text-[#4B4A5C] hover:bg-[#F7F7FB]',
+                                                sidebarDrop?.kind === 'notebook' && sidebarDrop.id === nb.id && sidebarDrop.position === 'before' ? 'border-t-2 border-emerald-500' : '',
+                                                sidebarDrop?.kind === 'notebook' && sidebarDrop.id === nb.id && sidebarDrop.position === 'after' ? 'border-b-2 border-emerald-500' : '',
+                                            ].join(' ')}
+                                        >
+                                            {editingNotebookId === nb.id ? (
+                                                <NotebookInputRow autoFocus defaultValue={nb.title} onSubmit={(title) => { renameNotebook(nb.id, title); setEditingNotebookId(null); }} onCancel={() => setEditingNotebookId(null)} />
+                                            ) : (
+                                                <>
+                                                    <span className="pl-2 text-[#A5A4B5]"><NotebookIcon /></span>
+                                                    <button onClick={() => setActiveNotebookId(nb.id)} onDoubleClick={() => setEditingNotebookId(nb.id)} className="min-w-0 flex-1 truncate px-2 py-2 text-left font-medium">{nb.title}</button>
+                                                    <button onClick={() => deleteNotebook(nb.id)} aria-label={`Delete ${nb.title}`} title="Delete notebook" className="mr-1 flex h-6 w-6 flex-shrink-0 items-center justify-center rounded-md text-[#A5A4B5] opacity-0 hover:bg-rose-50 hover:text-[#E5484D] group-hover/notebook:opacity-100"><XIcon /></button>
+                                                </>
+                                            )}
+                                        </div>
+                                    ))}
+                                    {groupItems.length === 0 && <p className="px-3 py-1.5 text-[11px] text-[#B0AFBD]">Drop notebooks here</p>}
+                                </div>}
+                            </section>
                         ))}
                     </div>
                 </aside>
@@ -692,27 +1010,27 @@ export default function MindmapPage() {
                 onMouseEnter={() => setBoardActive(true)}
                 onMouseLeave={() => setBoardActive(false)}
             >
-                <div className="absolute left-6 top-6 z-10 flex items-center gap-2">
+                <div data-canvas-controls className="absolute left-4 right-4 top-4 z-10 flex items-center gap-2 overflow-x-auto pb-1">
                     <button onClick={() => setIsSidebarOpen(v => !v)} className="flex h-10 w-10 items-center justify-center rounded-xl bg-white border border-[#E4E4ED] shadow-sm text-[#4B4A5C] hover:bg-[#F2F1FA] transition-colors">
                         <PanelLeftIcon />
                     </button>
-                    <button onClick={() => createNode(null, '', 'text')} disabled={!activeNotebookId} className="flex h-10 items-center justify-center gap-1.5 rounded-xl bg-[#7B61FF] px-4 font-bold text-sm text-white shadow hover:bg-[#6A4FF5] transition-colors disabled:cursor-not-allowed disabled:opacity-40">
+                    <button onClick={() => createNode(null, '', 'text')} disabled={!activeNotebookId} className="flex h-10 flex-shrink-0 items-center justify-center gap-1.5 rounded-xl bg-[#7B61FF] px-4 font-bold text-sm text-white shadow hover:bg-[#6A4FF5] transition-colors disabled:cursor-not-allowed disabled:opacity-40">
                         <PlusIcon /> Add
                     </button>
-                    <button onClick={rearrangeAll} disabled={!activeNotebookId} className="flex h-10 items-center justify-center gap-1.5 rounded-xl bg-white border border-[#E4E4ED] px-4 font-bold text-sm text-[#4B4A5C] shadow-sm hover:bg-[#F2F1FA] transition-colors disabled:cursor-not-allowed disabled:opacity-40">
+                    <button onClick={rearrangeAll} disabled={!activeNotebookId} className="flex h-10 flex-shrink-0 items-center justify-center gap-1.5 rounded-xl bg-white border border-[#E4E4ED] px-4 font-bold text-sm text-[#4B4A5C] shadow-sm hover:bg-[#F2F1FA] transition-colors disabled:cursor-not-allowed disabled:opacity-40">
                         <SparkleIcon /> Re-arrange
                     </button>
                     <label className="flex items-center gap-2 rounded-xl border border-[#E4E4ED] bg-white px-3 py-2 text-xs font-semibold text-[#4B4A5C] shadow-sm">
-                        <span>Follow</span>
+                        <span>Auto format</span>
                         <button
                             type="button"
                             aria-label="Toggle auto arrange"
-                            onClick={() => setAutoArrange((value) => !value)}
-                            className={`relative h-6 w-11 rounded-full transition-colors ${autoArrange ? 'bg-[#7B61FF]' : 'bg-[#D9D7E6]'}`}>
-                            <span className={`absolute top-1 left-0 h-4 w-4 rounded-full bg-white transition-transform ${autoArrange ? 'translate-x-6' : 'translate-x-1'}`} />
+                            onClick={() => setAutoFormat((value) => !value)}
+                            className={`relative h-6 w-11 flex-shrink-0 rounded-full transition-colors ${autoFormat ? 'bg-[#7B61FF]' : 'bg-[#D9D7E6]'}`}>
+                            <span className={`absolute top-1 left-0 h-4 w-4 rounded-full bg-white transition-transform ${autoFormat ? 'translate-x-6' : 'translate-x-1'}`} />
                         </button>
                     </label>
-                    <div className="flex h-10 items-center gap-1 rounded-xl bg-white border border-[#E4E4ED] px-2 shadow-sm text-[#4B4A5C]">
+                    <div className="flex h-10 flex-shrink-0 items-center gap-1 rounded-xl bg-white border border-[#E4E4ED] px-2 shadow-sm text-[#4B4A5C]">
                         <button onClick={() => zoomBy(-0.1)} className="flex h-7 w-7 items-center justify-center rounded-lg text-base font-medium hover:bg-[#F2F1FA]">−</button>
                         <span className="min-w-[46px] text-center text-xs font-bold text-[#8A8A9A]">{Math.round(zoom * 100)}%</span>
                         <button
@@ -733,16 +1051,18 @@ export default function MindmapPage() {
                         {edges.map((edge) => <path key={edge.id} d={edge.d} fill="none" stroke="#B9AEFF" strokeWidth={2.5} strokeLinecap="round" />)}
                     </svg>
 
-                    {nodes.map((node) => {
+                    {visibleNodes.map((node) => {
                         const isRoot = node.parentId === null;
                         const isSelected = selectedId === node.id;
+                        const childCount = nodes.filter((child) => child.parentId === node.id).length;
                         return (
                             <div
-                                key={node.id} id={`node-${node.id}`}
+                                key={node.id} id={`node-${node.id}`} data-node-id={node.id}
                                 className={[
                                     'group absolute rounded-2xl border shadow-sm transition-shadow flex flex-col items-center justify-center',
                                     isRoot ? 'border-[#2B2A3D] text-white' : 'border-[#DEDCEB] text-[#201F2E]',
                                     isSelected ? 'ring-2 ring-[#7B61FF] ring-offset-2 ring-offset-[#FAFAFC]' : '',
+                                    dropTargetId === node.id ? 'ring-2 ring-[#19A974] ring-offset-2' : '',
                                 ].join(' ')}
                                 style={{
                                     left: node.x, top: node.y, width: node.width || DEFAULT_W,
@@ -800,6 +1120,18 @@ export default function MindmapPage() {
                                 )}
 
                                 <button onPointerDown={(e) => e.stopPropagation()} onClick={(e) => { e.stopPropagation(); createNode(node.id, '', 'text'); }} className="absolute -right-3 top-1/2 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded-full bg-[#7B61FF] text-white opacity-0 shadow-md transition-opacity duration-150 group-hover:opacity-100 hover:bg-[#6A4FF5]"><PlusIcon /></button>
+                                {childCount > 0 && (
+                                    <button
+                                        type="button"
+                                        onPointerDown={(e) => e.stopPropagation()}
+                                        onClick={(e) => { e.stopPropagation(); toggleChildren(node.id); }}
+                                        aria-label={`${collapsedNodeIds.has(node.id) ? 'Show' : 'Hide'} ${childCount} child nodes`}
+                                        title={`${collapsedNodeIds.has(node.id) ? 'Show' : 'Hide'} child nodes`}
+                                        className="absolute -bottom-3 left-1/2 z-10 flex h-6 min-w-6 -translate-x-1/2 items-center justify-center gap-1 rounded-full border border-[#DEDCEB] bg-white px-1.5 text-[10px] font-semibold text-[#686779] shadow-sm hover:border-[#7B61FF] hover:text-[#4B33E0]"
+                                    >
+                                        <span>{collapsedNodeIds.has(node.id) ? '+' : '−'}</span><span>{childCount}</span>
+                                    </button>
+                                )}
                                 <div onPointerDown={(e) => handleResizePointerDown(e, node)} className={`absolute bottom-0 right-0 w-4 h-4 cursor-nwse-resize opacity-0 group-hover:opacity-100 ${isSelected ? 'opacity-100' : ''}`} style={{ background: 'linear-gradient(135deg, transparent 50%, #B9AEFF 50%)', borderBottomRightRadius: '14px' }} />
                             </div>
                         );
@@ -867,4 +1199,24 @@ function SparkleIcon() {
 
 function CenterIcon() {
     return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4"><circle cx="12" cy="12" r="3" /><path d="M12 2v3m0 14v3M2 12h3m14 0h3" /></svg>;
+}
+
+function ChevronIcon({ collapsed }: { collapsed: boolean }) {
+    return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className={`h-3.5 w-3.5 transition-transform ${collapsed ? '-rotate-90' : 'rotate-0'}`}><path d="m6 9 6 6 6-6" /></svg>;
+}
+
+function FolderIcon() {
+    return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4 flex-shrink-0"><path d="M3 7.5A1.5 1.5 0 0 1 4.5 6H10l2 2h7.5A1.5 1.5 0 0 1 21 9.5v8a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 17.5z" /></svg>;
+}
+
+function FolderPlusIcon() {
+    return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" className="h-[18px] w-[18px]"><path d="M3 7.5A1.5 1.5 0 0 1 4.5 6H10l2 2h6.5A1.5 1.5 0 0 1 20 9.5v3" /><path d="M17 16v6m-3-3h6" /><path d="M3 9v8.5A1.5 1.5 0 0 0 4.5 19H12" /></svg>;
+}
+
+function NotebookIcon() {
+    return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4"><rect x="5" y="3" width="15" height="18" rx="2" /><path d="M9 3v18M2.5 7h2.5m-2.5 5h2.5m-2.5 5h2.5" /></svg>;
+}
+
+function NotebookPlusIcon() {
+    return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" className="h-[18px] w-[18px]"><rect x="4" y="3" width="13" height="18" rx="2" /><path d="M8 3v18M2 7h2m-2 5h2m-2 5h2m15-8v7m-3.5-3.5h7" /></svg>;
 }
