@@ -14,7 +14,9 @@ interface NodeRow {
     id: string; notebook_id: string; parent_id: string | null;
     text: string; x: number; y: number;
     type: string; width: number; height: number;
+    auto_width: number;
     image_url: string | null; preserve_aspect: number; color: string | null;
+    text_align: 'left' | 'center' | 'right';
     created_at: string; updated_at: string;
 }
 
@@ -61,9 +63,11 @@ function getDb(): Database.Database {
     addCol("ALTER TABLE mindmap_nodes ADD COLUMN type TEXT DEFAULT 'text'");
     addCol("ALTER TABLE mindmap_nodes ADD COLUMN width REAL DEFAULT 208");
     addCol("ALTER TABLE mindmap_nodes ADD COLUMN height REAL DEFAULT 60");
+    addCol("ALTER TABLE mindmap_nodes ADD COLUMN auto_width INTEGER NOT NULL DEFAULT 1");
     addCol("ALTER TABLE mindmap_nodes ADD COLUMN image_url TEXT DEFAULT NULL");
     addCol("ALTER TABLE mindmap_nodes ADD COLUMN preserve_aspect INTEGER DEFAULT 1");
     addCol("ALTER TABLE mindmap_nodes ADD COLUMN color TEXT DEFAULT NULL");
+    addCol("ALTER TABLE mindmap_nodes ADD COLUMN text_align TEXT NOT NULL DEFAULT 'center'");
     db.exec(`INSERT OR IGNORE INTO mindmap_notebook_groups (name)
             SELECT DISTINCT group_name FROM mindmap_notebooks WHERE TRIM(group_name) <> ''`);
 
@@ -149,13 +153,13 @@ export async function POST(req: NextRequest) {
         }
 
         if (body.resource === 'node') {
-            const { notebookId, parentId = null, text = '', x = 0, y = 0, type = 'text', width = 208, height = 60, imageUrl = null, preserveAspect = 1, color = null } = body;
+            const { notebookId, parentId = null, text = '', x = 0, y = 0, type = 'text', width = 208, height = 60, autoWidth = true, imageUrl = null, preserveAspect = 1, color = null } = body;
             if (!notebookId) return badRequest('notebookId is required');
             const id = body.id || randomUUID();
 
-            db.prepare(`INSERT INTO mindmap_nodes (id, notebook_id, parent_id, text, x, y, type, width, height, image_url, preserve_aspect, color)
-                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-            ).run(id, notebookId, parentId, text, x, y, type, width, height, imageUrl, preserveAspect, color);
+            db.prepare(`INSERT INTO mindmap_nodes (id, notebook_id, parent_id, text, x, y, type, width, height, auto_width, image_url, preserve_aspect, color)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            ).run(id, notebookId, parentId, text, x, y, type, width, height, Number(Boolean(autoWidth)), imageUrl, preserveAspect, color);
 
             const node = db.prepare('SELECT * FROM mindmap_nodes WHERE id = ?').get(id);
             return NextResponse.json({ node });
@@ -212,7 +216,7 @@ export async function PATCH(req: NextRequest) {
         }
 
         if (body.resource === 'node') {
-            const { id, text, x, y, width, height, preserveAspect, color, parentId } = body;
+            const { id, text, x, y, width, height, autoWidth, preserveAspect, color, parentId, textAlign, type, imageUrl } = body;
             const existing = db.prepare('SELECT * FROM mindmap_nodes WHERE id = ?').get(id) as NodeRow;
             if (!existing) return NextResponse.json({ error: 'Not found' }, { status: 404 });
 
@@ -226,12 +230,19 @@ export async function PATCH(req: NextRequest) {
                 if (isDescendant || parentId === id) return badRequest('A node cannot be moved under its own descendant');
             }
 
+            const validTextAlign = ['left', 'center', 'right'].includes(textAlign) ? textAlign : existing.text_align || 'center';
+            const validType = type === 'image' || type === 'text' ? type : existing.type;
+            const savedPreserveAspect = preserveAspect === undefined
+                ? existing.preserve_aspect
+                : Number(Boolean(preserveAspect));
+            const savedAutoWidth = autoWidth === undefined ? existing.auto_width : Number(Boolean(autoWidth));
             db.prepare(`UPDATE mindmap_nodes
-                  SET text = ?, x = ?, y = ?, width = ?, height = ?, preserve_aspect = ?, color = ?, parent_id = ?, updated_at = ?
+                                    SET text = ?, x = ?, y = ?, width = ?, height = ?, auto_width = ?, preserve_aspect = ?, color = ?, parent_id = ?, text_align = ?, type = ?, image_url = ?, updated_at = ?
                   WHERE id = ?`).run(
                 text ?? existing.text, x ?? existing.x, y ?? existing.y, width ?? existing.width, height ?? existing.height,
-                preserveAspect ?? existing.preserve_aspect, color !== undefined ? color : existing.color,
-                parentId !== undefined ? parentId : existing.parent_id, nowIso(), id
+                savedAutoWidth, savedPreserveAspect, color !== undefined ? color : existing.color,
+                parentId !== undefined ? parentId : existing.parent_id, validTextAlign, validType,
+                imageUrl !== undefined ? imageUrl : existing.image_url, nowIso(), id
             );
             return NextResponse.json({ ok: true });
         }
