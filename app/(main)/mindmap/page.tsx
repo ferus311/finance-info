@@ -14,7 +14,20 @@ const inter = Inter({ subsets: ['latin'], weight: ['400', '500', '600'], variabl
 
 const API_BASE = '/api/mindmap';
 
-type Notebook = { id: string; title: string; groupName: string; sortOrder: number };
+type Language = 'vi' | 'en' | 'ja';
+type AIProvider = 'openai' | 'gemini';
+type NodeComparison = { language: Language; text: string };
+const AI_MODELS: Record<AIProvider, { id: string; label: string }[]> = {
+    openai: [
+        { id: 'gpt-4o-mini', label: 'GPT-4o mini' },
+        { id: 'gpt-4.1-mini', label: 'GPT-4.1 mini' },
+    ],
+    gemini: [
+        { id: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash' },
+        { id: 'gemini-2.5-flash-lite', label: 'Gemini 2.5 Flash Lite' },
+    ],
+};
+type Notebook = { id: string; title: string; groupName: string; sortOrder: number; language: Language; description: string };
 type NotebookGroup = { name: string; sortOrder: number };
 type SidebarDrag = { kind: 'notebook' | 'group'; id: string };
 type SidebarDrop = { kind: 'notebook' | 'group'; id: string; position: 'before' | 'after' | 'inside' };
@@ -25,7 +38,27 @@ type MindNode = {
     type: 'text' | 'image'; width: number; height: number; autoWidth: boolean;
     imageUrl: string | null; preserveAspect: boolean; color: string | null;
     textAlign: 'left' | 'center' | 'right';
+    translationPending: boolean;
 };
+type MindNodeResponse = {
+    id: string; notebook_id: string; parent_id: string | null;
+    text: string; x: number; y: number; type?: string | null;
+    width: number; height: number; auto_width?: number | null;
+    image_url: string | null; preserve_aspect?: number | null;
+    color: string | null; text_align?: 'left' | 'center' | 'right' | null;
+    display_text?: string; translation_pending?: number;
+};
+
+function mapMindNode(node: MindNodeResponse): MindNode {
+    return {
+        id: node.id, notebookId: node.notebook_id, parentId: node.parent_id,
+        text: node.display_text ?? node.text, x: node.x, y: node.y,
+        type: (node.type as 'text' | 'image') || 'text', width: node.width, height: node.height,
+        autoWidth: Boolean(node.auto_width ?? 1), imageUrl: node.image_url,
+        preserveAspect: Boolean(node.preserve_aspect ?? 1), color: node.color,
+        textAlign: node.text_align || 'center', translationPending: Boolean(node.translation_pending),
+    };
+}
 
 const DEFAULT_W = 208, DEFAULT_H = 60;
 const MAX_AUTO_NODE_W = 400;
@@ -176,6 +209,14 @@ export default function MindmapPage() {
     const [selectedId, setSelectedId] = useState<string | null>(null);
     const [editingId, setEditingId] = useState<string | null>(null);
     const [contextMenu, setContextMenu] = useState<{ x: number; y: number; nodeId: string } | null>(null);
+    const [notebookContextMenu, setNotebookContextMenu] = useState<{ x: number; y: number; notebookId: string } | null>(null);
+    const [descriptionEditor, setDescriptionEditor] = useState<{ notebookId: string; value: string } | null>(null);
+    const [isTranslating, setIsTranslating] = useState(false);
+    const [translatingNodeId, setTranslatingNodeId] = useState<string | null>(null);
+    const [translationTargetLanguage, setTranslationTargetLanguage] = useState<Language>('en');
+    const [translationProvider, setTranslationProvider] = useState<AIProvider>('gemini');
+    const [translationModel, setTranslationModel] = useState(AI_MODELS.gemini[0].id);
+    const [nodeComparisons, setNodeComparisons] = useState<Record<string, NodeComparison>>({});
     const [error, setError] = useState<string | null>(null);
 
     const [zoom, setZoom] = useState(1);
@@ -187,12 +228,18 @@ export default function MindmapPage() {
 
     const containerRef = useRef<HTMLDivElement>(null);
     const contextMenuRef = useRef<HTMLDivElement>(null);
+    const notebookContextMenuRef = useRef<HTMLDivElement>(null);
+    const translationBusyRef = useRef(false);
     const panRef = useRef({ panning: false });
     const viewRef = useRef({ zoom: 1, pan: DEFAULT_PAN });
     const touchPointersRef = useRef(new Map<number, { x: number; y: number }>());
     const pinchRef = useRef<{ distance: number; centerX: number; centerY: number } | null>(null);
     const dragRef = useRef<{ type: 'move' | 'resize' | null, id: string | null, startX: number, startY: number, startW: number, startH: number }>({ type: null, id: null, startX: 0, startY: 0, startW: 0, startH: 0 });
     const nodesRef = useRef<MindNode[]>([]);
+    const activeNotebook = notebooks.find((notebook) => notebook.id === activeNotebookId) ?? null;
+    const activeLanguage = activeNotebook?.language ?? 'vi';
+    const activeViewRef = useRef({ notebookId: activeNotebookId, language: activeLanguage });
+    activeViewRef.current = { notebookId: activeNotebookId, language: activeLanguage };
 
     useEffect(() => {
         nodesRef.current = nodes;
@@ -202,7 +249,8 @@ export default function MindmapPage() {
         try {
             const savedGroups = JSON.parse(window.localStorage.getItem('mindmap-collapsed-groups') || '[]');
             if (Array.isArray(savedGroups)) {
-                setCollapsedNotebookGroups(new Set(savedGroups.filter((name): name is string => typeof name === 'string')));
+                const groupNames = savedGroups.filter((name): name is string => typeof name === 'string');
+                queueMicrotask(() => setCollapsedNotebookGroups(new Set(groupNames)));
             }
         } catch { }
     }, []);
@@ -273,36 +321,40 @@ export default function MindmapPage() {
             setLoadingNotebooks(true);
             try {
                 const data = await apiFetch(`${API_BASE}?resource=notebooks`);
-                const mapped: Notebook[] = (data.notebooks as { id: string; title: string; group_name?: string; sort_order?: number }[]).map((n) => ({
+                const mapped: Notebook[] = (data.notebooks as { id: string; title: string; group_name?: string; sort_order?: number; language?: Language; description?: string }[]).map((n) => ({
                     id: n.id, title: n.title, groupName: n.group_name || '', sortOrder: n.sort_order || 0,
+                    language: n.language || 'vi', description: n.description || '',
                 }));
                 setNotebooks(mapped);
                 setNotebookGroups((data.groups as { name: string; sort_order: number }[] || []).map((group) => ({ name: group.name, sortOrder: group.sort_order })));
-                if (mapped.length > 0) setActiveNotebookId(mapped[0].id);
+                const savedNotebookId = window.localStorage.getItem('mindmap-active-notebook');
+                const activeId = mapped.find((notebook) => notebook.id === savedNotebookId)?.id ?? mapped[0]?.id;
+                if (activeId) setActiveNotebookId(activeId);
             } catch { setError('Could not load notebooks.'); } finally { setLoadingNotebooks(false); }
         })();
     }, []);
 
     useEffect(() => {
-        if (!activeNotebookId) { setNodes([]); return; }
+        if (activeNotebookId) window.localStorage.setItem('mindmap-active-notebook', activeNotebookId);
+    }, [activeNotebookId]);
+
+    useEffect(() => {
+        if (!activeNotebookId) {
+            queueMicrotask(() => setNodes([]));
+            return;
+        }
         let cancelled = false;
         (async () => {
             setLoadingNodes(true); setSelectedId(null); setEditingId(null);
             try {
-                const data = await apiFetch(`${API_BASE}?resource=nodes&notebookId=${activeNotebookId}`);
+                const data = await apiFetch(`${API_BASE}?resource=nodes&notebookId=${activeNotebookId}&language=${activeLanguage}`) as { nodes: MindNodeResponse[] };
                 if (cancelled) return;
-                const mapped: MindNode[] = data.nodes.map((n: any) => ({
-                    id: n.id, notebookId: n.notebook_id, parentId: n.parent_id,
-                    text: n.text, x: n.x, y: n.y, type: (n.type as 'text' | 'image') || 'text',
-                    width: n.width, height: n.height, autoWidth: Boolean(n.auto_width ?? 1), imageUrl: n.image_url,
-                    preserveAspect: Boolean(n.preserve_aspect ?? 1), color: n.color,
-                    textAlign: n.text_align || 'center'
-                }));
+                const mapped: MindNode[] = data.nodes.map(mapMindNode);
                 setNodes(mapped); setPan(DEFAULT_PAN); setZoom(1);
             } catch { if (!cancelled) setError('Could not load this board.'); } finally { if (!cancelled) setLoadingNodes(false); }
         })();
         return () => { cancelled = true; };
-    }, [activeNotebookId]);
+    }, [activeNotebookId, activeLanguage]);
 
     // Bắt sự kiện bàn phím toàn cầu (Global Hotkeys)
     useEffect(() => {
@@ -332,11 +384,34 @@ export default function MindmapPage() {
 
     useEffect(() => {
         if (!contextMenu) return;
+        const frameId = window.requestAnimationFrame(() => {
+            const element = contextMenuRef.current;
+            if (!element) return;
+            const bounds = element.getBoundingClientRect();
+            const left = Math.max(8, Math.min(contextMenu.x, window.innerWidth - bounds.width - 8));
+            const top = Math.max(8, Math.min(contextMenu.y, window.innerHeight - bounds.height - 8));
+            setContextMenu((current) => {
+                if (!current || current.nodeId !== contextMenu.nodeId || (current.x === left && current.y === top)) return current;
+                return { ...current, x: left, y: top };
+            });
+        });
         function handlePointerDown(e: PointerEvent) { if (contextMenuRef.current && !contextMenuRef.current.contains(e.target as Node)) setContextMenu(null); }
         function handleKey(e: KeyboardEvent) { if (e.key === 'Escape') setContextMenu(null); }
         window.addEventListener('pointerdown', handlePointerDown); window.addEventListener('keydown', handleKey);
-        return () => { window.removeEventListener('pointerdown', handlePointerDown); window.removeEventListener('keydown', handleKey); };
+        return () => {
+            window.cancelAnimationFrame(frameId);
+            window.removeEventListener('pointerdown', handlePointerDown);
+            window.removeEventListener('keydown', handleKey);
+        };
     }, [contextMenu]);
+
+    useEffect(() => {
+        if (!notebookContextMenu) return;
+        function handlePointerDown(e: PointerEvent) { if (notebookContextMenuRef.current && !notebookContextMenuRef.current.contains(e.target as Node)) setNotebookContextMenu(null); }
+        function handleKey(e: KeyboardEvent) { if (e.key === 'Escape') setNotebookContextMenu(null); }
+        window.addEventListener('pointerdown', handlePointerDown); window.addEventListener('keydown', handleKey);
+        return () => { window.removeEventListener('pointerdown', handlePointerDown); window.removeEventListener('keydown', handleKey); };
+    }, [notebookContextMenu]);
 
     useEffect(() => {
         const handlePaste = async (e: ClipboardEvent) => {
@@ -386,6 +461,120 @@ export default function MindmapPage() {
         }).catch(() => setError('Could not save node positions.'));
     }
 
+    async function runPendingTranslations(notebookId: string, mode: 'manual' | 'force') {
+        if (translationBusyRef.current) return;
+        translationBusyRef.current = true;
+        setIsTranslating(true);
+        setError(null);
+        try {
+            if (mode === 'force') {
+                await apiFetch(`${API_BASE}`, {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ resource: 'queue-force-retranslate', notebookId }),
+                });
+            }
+            for (let batch = 0; batch < 20; batch += 1) {
+                const result = await apiFetch(`${API_BASE}`, {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ resource: 'translate-pending', notebookId, mode }),
+                }) as { translations: { id: string; texts: Partial<Record<Language, string>> }[]; pendingCount: number };
+                const view = activeViewRef.current;
+                if (view.notebookId === notebookId) {
+                    const refreshed = await apiFetch(`${API_BASE}?resource=nodes&notebookId=${notebookId}&language=${view.language}`) as { nodes: MindNodeResponse[] };
+                    if (activeViewRef.current.notebookId === notebookId && activeViewRef.current.language === view.language) {
+                        setNodes(refreshed.nodes.map(mapMindNode));
+                    }
+                }
+                if (result.pendingCount === 0 || result.translations.length === 0) break;
+            }
+        } catch (translationError) {
+            setError(translationError instanceof Error ? translationError.message : 'Could not translate pending nodes.');
+        } finally {
+            translationBusyRef.current = false;
+            setIsTranslating(false);
+        }
+    }
+
+    async function changeNotebookLanguage(language: Language) {
+        if (!activeNotebook || activeNotebook.language === language) return;
+        try {
+            await apiFetch(`${API_BASE}`, {
+                method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ resource: 'notebook', id: activeNotebook.id, language }),
+            });
+            setNotebooks((previous) => previous.map((notebook) => notebook.id === activeNotebook.id ? { ...notebook, language } : notebook));
+        } catch {
+            setError('Could not change board language.');
+        }
+    }
+
+    async function saveNotebookDescription() {
+        if (!descriptionEditor) return;
+        const { notebookId, value } = descriptionEditor;
+        try {
+            await apiFetch(`${API_BASE}`, {
+                method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ resource: 'notebook', id: notebookId, description: value }),
+            });
+            setNotebooks((previous) => previous.map((notebook) => notebook.id === notebookId ? { ...notebook, description: value.trim().slice(0, 2000) } : notebook));
+            setDescriptionEditor(null);
+        } catch {
+            setError('Could not save notebook description.');
+        }
+    }
+
+    function reflowComparedNodes() {
+        window.requestAnimationFrame(() => {
+            const arranged = formatVisibleTree(nodesRef.current, collapsedNodeIds);
+            setNodes(arranged);
+            persistPositions(arranged);
+        });
+    }
+
+    async function translateNodeToLanguage(nodeId: string, language: Language) {
+        setTranslatingNodeId(nodeId);
+        setError(null);
+        try {
+            const result = await apiFetch(`${API_BASE}`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ resource: 'translate-node', nodeId, targetLanguage: language, provider: translationProvider, model: translationModel }),
+            }) as NodeComparison;
+            setNodeComparisons((previous) => ({ ...previous, [nodeId]: result }));
+            setContextMenu(null);
+            reflowComparedNodes();
+        } catch (translationError) {
+            setError(translationError instanceof Error ? translationError.message : 'Could not translate this node.');
+        } finally {
+            setTranslatingNodeId(null);
+        }
+    }
+
+    async function toggleNodeComparison(nodeId: string, language: Language) {
+        if (nodeComparisons[nodeId]?.language === language) {
+            setNodeComparisons((previous) => {
+                const next = { ...previous };
+                delete next[nodeId];
+                return next;
+            });
+            setContextMenu(null);
+            reflowComparedNodes();
+            return;
+        }
+
+        try {
+            const result = await apiFetch(`${API_BASE}?resource=node-translation&nodeId=${encodeURIComponent(nodeId)}&language=${language}`) as { text: string };
+            setNodeComparisons((previous) => ({ ...previous, [nodeId]: { language, text: result.text } }));
+            setContextMenu(null);
+            reflowComparedNodes();
+        } catch (translationError) {
+            if (translationError instanceof Error && translationError.message === 'No current translation for this node and language.') {
+                await translateNodeToLanguage(nodeId, language);
+                return;
+            }
+            setError(translationError instanceof Error ? translationError.message : 'Could not load this translation.');
+        }
+    }
+
     function createStableId() {
         const cryptoObj = typeof globalThis !== 'undefined' ? globalThis.crypto : undefined;
         if (cryptoObj && typeof cryptoObj.randomUUID === 'function') {
@@ -414,10 +603,11 @@ export default function MindmapPage() {
     async function createNotebook(title: string, groupName = '') {
         const id = createStableId(), rootId = createStableId(), cleanTitle = title.trim() || 'Untitled notebook';
         try {
-            await apiFetch(`${API_BASE}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ resource: 'notebook', id, title: cleanTitle, rootId, groupName }) });
-            setNotebooks((prev) => [...prev, { id, title: cleanTitle, groupName, sortOrder: prev.filter((item) => item.groupName === groupName).length }]);
+            await apiFetch(`${API_BASE}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ resource: 'notebook', id, title: cleanTitle, rootId, groupName, language: activeLanguage }) });
+            setNotebooks((prev) => [...prev, { id, title: cleanTitle, groupName, language: activeLanguage, description: '', sortOrder: prev.filter((item) => item.groupName === groupName).length }]);
             setActiveNotebookId(id);
-            setNodes([{ id: rootId, notebookId: id, parentId: null, text: 'Central idea', x: 0, y: 0, type: 'text', width: DEFAULT_W, height: DEFAULT_H, autoWidth: true, imageUrl: null, preserveAspect: true, color: null, textAlign: 'center' }]);
+            const rootText = activeLanguage === 'ja' ? '中心となる考え' : activeLanguage === 'vi' ? 'Ý tưởng trung tâm' : 'Central idea';
+            setNodes([{ id: rootId, notebookId: id, parentId: null, text: rootText, x: 0, y: 0, type: 'text', width: DEFAULT_W, height: DEFAULT_H, autoWidth: true, imageUrl: null, preserveAspect: true, color: null, textAlign: 'center', translationPending: true }]);
             setPan(DEFAULT_PAN); setZoom(1);
         } catch {
             setError('Could not create this notebook.');
@@ -579,7 +769,7 @@ export default function MindmapPage() {
 
         const newNode: MindNode = {
             id: newNodeId, notebookId: activeNotebookId, parentId, text,
-            x: initialX, y: initialY, type, width, height, autoWidth: true, imageUrl, preserveAspect: true, color: null, textAlign: 'center'
+            x: initialX, y: initialY, type, width, height, autoWidth: true, imageUrl, preserveAspect: true, color: null, textAlign: 'center', translationPending: false,
         };
 
         setNodes((prevNodes) => {
@@ -589,7 +779,7 @@ export default function MindmapPage() {
 
         void apiFetch(`${API_BASE}`, {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ resource: 'node', ...newNode, imageUrl, preserveAspect: 1 })
+            body: JSON.stringify({ resource: 'node', ...newNode, imageUrl, preserveAspect: 1, language: activeLanguage })
         }).then(() => {
             if (autoFormat) {
                 window.requestAnimationFrame(() => {
@@ -617,12 +807,27 @@ export default function MindmapPage() {
 
     function updateNodeProps(id: string, updates: Partial<MindNode>) {
         const currentNode = nodesRef.current.find((node) => node.id === id);
+        const textChanged = typeof updates.text === 'string' && updates.text !== currentNode?.text;
         const savedUpdates = updates.text !== undefined && currentNode?.autoWidth
             ? { ...updates, width: getAutoNodeWidth(updates.text) }
             : updates;
-        setNodes((previous) => previous.map((node) => node.id === id ? { ...node, ...savedUpdates } : node));
-        void apiFetch(`${API_BASE}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ resource: 'node', id, ...savedUpdates }) })
-            .catch(() => setError('Could not save this node.'));
+        setNodes((previous) => previous.map((node) => node.id === id ? {
+            ...node, ...savedUpdates,
+            translationPending: textChanged ? Boolean(updates.text?.trim()) : node.translationPending,
+        } : node));
+        if (textChanged) {
+            setNodeComparisons((previous) => {
+                const next = { ...previous };
+                delete next[id];
+                return next;
+            });
+        }
+        const apiUpdates = { ...savedUpdates };
+        if (!textChanged) delete apiUpdates.text;
+        void apiFetch(`${API_BASE}`, {
+            method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ resource: 'node', id, ...apiUpdates, ...(textChanged ? { language: activeLanguage } : {}) }),
+        }).catch(() => setError('Could not save this node.'));
         if ((savedUpdates.text !== undefined || savedUpdates.width !== undefined || savedUpdates.height !== undefined) && autoFormat) {
             window.requestAnimationFrame(() => {
                 const laidOut = formatVisibleTree(nodesRef.current, collapsedNodeIds);
@@ -874,6 +1079,8 @@ export default function MindmapPage() {
             notebooks: notebooks.filter((notebook) => !notebook.groupName).sort((a, b) => a.sortOrder - b.sortOrder),
         },
     ];
+    const pendingTranslationCount = nodes.filter((node) => node.translationPending).length;
+    const forceTranslationCount = nodes.filter((node) => node.text.trim()).length;
 
     return (
         <div className={`${manrope.variable} ${inter.variable} flex h-full min-h-0 w-full min-w-0 overflow-hidden bg-[#FAFAFC]`} style={{ fontFamily: 'var(--font-ui)' }}>
@@ -1006,6 +1213,12 @@ export default function MindmapPage() {
                                                 setSidebarDrop(null);
                                             }}
                                             onDragEnd={() => { setSidebarDrag(null); setSidebarDrop(null); }}
+                                            onContextMenu={(event) => {
+                                                event.preventDefault();
+                                                event.stopPropagation();
+                                                setContextMenu(null);
+                                                setNotebookContextMenu({ x: event.clientX, y: event.clientY, notebookId: nb.id });
+                                            }}
                                             className={[
                                                 'group/notebook relative flex min-w-0 items-center rounded-lg text-sm transition-colors',
                                                 nb.id === activeNotebookId ? 'bg-[#EFECFF] text-[#4B33E0]' : 'text-[#4B4A5C] hover:bg-[#F7F7FB]',
@@ -1063,6 +1276,38 @@ export default function MindmapPage() {
                     <button onClick={rearrangeAll} disabled={!activeNotebookId} className="flex h-10 flex-shrink-0 items-center justify-center gap-1.5 rounded-xl bg-white border border-[#E4E4ED] px-4 font-bold text-sm text-[#4B4A5C] shadow-sm hover:bg-[#F2F1FA] transition-colors disabled:cursor-not-allowed disabled:opacity-40">
                         <SparkleIcon /> Re-arrange
                     </button>
+                    <select
+                        aria-label="Board language"
+                        value={activeLanguage}
+                        disabled={!activeNotebookId}
+                        onChange={(event) => { void changeNotebookLanguage(event.target.value as Language); }}
+                        className="h-10 flex-shrink-0 rounded-xl border border-[#E4E4ED] bg-white px-3 text-sm font-semibold text-[#4B4A5C] shadow-sm outline-none focus:border-[#7B61FF] disabled:opacity-40"
+                    >
+                        <option value="vi">Tiếng Việt</option>
+                        <option value="ja">日本語</option>
+                        <option value="en">English</option>
+                    </select>
+                    {/* Keep batch actions for future use; hide them while per-node translation is preferred. */}
+                    <button
+                        onClick={() => { if (activeNotebookId) void runPendingTranslations(activeNotebookId, 'manual'); }}
+                        disabled={!activeNotebookId || pendingTranslationCount === 0 || isTranslating}
+                        title="Translate missing languages for nodes without current translations"
+                        className="hidden flex h-10 flex-shrink-0 items-center justify-center gap-1.5 rounded-xl border border-[#E4E4ED] bg-white px-3 text-sm font-semibold text-[#4B4A5C] shadow-sm hover:bg-[#F2F1FA] disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                        <SparkleIcon /> {isTranslating ? 'Translating…' : `Translate missing (${pendingTranslationCount})`}
+                    </button>
+                    <button
+                        onClick={() => {
+                            if (!activeNotebookId || forceTranslationCount === 0) return;
+                            const confirmed = window.confirm(`Re-translate all ${forceTranslationCount} non-empty nodes into the other languages? This will overwrite current translations and use AI credits.`);
+                            if (confirmed) void runPendingTranslations(activeNotebookId, 'force');
+                        }}
+                        disabled={!activeNotebookId || forceTranslationCount === 0 || isTranslating}
+                        title="Overwrite existing translations for every non-empty node in this board"
+                        className="hidden flex h-10 flex-shrink-0 items-center justify-center gap-1.5 rounded-xl border border-rose-200 bg-white px-3 text-sm font-semibold text-rose-700 shadow-sm hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                        <SparkleIcon /> Force retranslate ({forceTranslationCount})
+                    </button>
                     <label className="flex items-center gap-2 rounded-xl border border-[#E4E4ED] bg-white px-3 py-2 text-xs font-semibold text-[#4B4A5C] shadow-sm">
                         <span>Auto format</span>
                         <button
@@ -1098,6 +1343,7 @@ export default function MindmapPage() {
                         const isRoot = node.parentId === null;
                         const isSelected = selectedId === node.id;
                         const childCount = nodes.filter((child) => child.parentId === node.id).length;
+                        const comparison = nodeComparisons[node.id];
                         return (
                             <div
                                 key={node.id} id={`node-${node.id}`} data-node-id={node.id}
@@ -1108,7 +1354,7 @@ export default function MindmapPage() {
                                     dropTargetId === node.id ? 'ring-2 ring-[#19A974] ring-offset-2' : '',
                                 ].join(' ')}
                                 style={{
-                                    left: node.x, top: node.y, width: node.width || DEFAULT_W,
+                                    left: node.x, top: node.y, width: comparison ? (node.width || DEFAULT_W) * 2 + 16 : node.width || DEFAULT_W,
                                     minHeight: node.imageUrl ? undefined : node.height || DEFAULT_H,
                                     backgroundColor: node.color || (isRoot ? '#2B2A3D' : '#ffffff'),
                                     cursor: dragRef.current.id === node.id ? 'grabbing' : 'grab',
@@ -1117,7 +1363,13 @@ export default function MindmapPage() {
                                 }}
                                 onPointerDown={(e) => handleNodePointerDown(e, node)} onPointerMove={handlePointerMove} onPointerUp={handlePointerUp}
                                 onDoubleClick={(e) => { e.stopPropagation(); setEditingId(node.id); }}
-                                onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); setSelectedId(node.id); setContextMenu({ x: e.clientX, y: e.clientY, nodeId: node.id }); }}
+                                onContextMenu={(e) => {
+                                    e.preventDefault();
+                                    e.stopPropagation();
+                                    setSelectedId(node.id);
+                                    setTranslationTargetLanguage((['vi', 'ja', 'en'] as const).find((language) => language !== activeLanguage) ?? 'vi');
+                                    setContextMenu({ x: e.clientX, y: e.clientY, nodeId: node.id });
+                                }}
                             >
                                 {node.imageUrl && (
                                     <div id={`node-media-${node.id}`} className="flex w-full flex-shrink-0 items-center justify-center overflow-hidden rounded-t-2xl p-1.5" style={{ height: node.height || DEFAULT_H }}>
@@ -1126,46 +1378,51 @@ export default function MindmapPage() {
                                 )}
 
                                 {(!node.imageUrl || node.text || editingId === node.id) && (
-                                    <div className={`flex w-full items-center ${node.imageUrl ? 'min-h-12 border-t border-black/10 px-3 py-2' : 'h-full px-4 py-3'}`}>
-                                        {editingId === node.id ? (
-                                            <textarea
-                                                autoFocus defaultValue={node.text} onPointerDown={(e) => e.stopPropagation()}
-                                                onBlur={(e) => { updateNodeProps(node.id, { text: e.target.value }); setEditingId(prev => prev === node.id ? null : prev); }}
-                                                onChange={(e) => {
-                                                    const text = e.currentTarget.value;
-                                                    const width = !node.autoWidth
-                                                        ? node.width || DEFAULT_W
-                                                        : getAutoNodeWidth(text);
-                                                    setNodes((previous) => previous.map((item) => item.id === node.id ? { ...item, text, width } : item));
-                                                }}
-                                                onKeyDown={(e) => {
-                                                    if (e.key === 'Enter' && !e.shiftKey) {
-                                                        e.preventDefault();
-                                                        updateNodeProps(node.id, { text: e.currentTarget.value });
-                                                        if (e.ctrlKey || e.metaKey) {
-                                                            // Ctrl + Enter: Tạo nhánh ngang cấp cha
-                                                            const parentNode = nodes.find(n => n.id === node.parentId);
-                                                            createNode(parentNode ? parentNode.parentId : null, '', 'text');
-                                                        } else {
-                                                            // Enter: Tạo nhánh ngang hàng (Sibling)
-                                                            createNode(node.parentId, '', 'text');
+                                    <div className={`flex w-full items-stretch ${node.imageUrl ? 'min-h-12 border-t border-black/10' : 'h-full'}`}>
+                                        <div className={`${comparison ? 'w-1/2 border-r border-black/10' : 'w-full'} flex min-w-0 items-center ${node.imageUrl ? 'px-3 py-2' : 'px-4 py-3'}`}>
+                                            {editingId === node.id ? (
+                                                <textarea
+                                                    autoFocus defaultValue={node.text} onPointerDown={(e) => e.stopPropagation()}
+                                                    onBlur={(e) => { if (e.target.value !== node.text) updateNodeProps(node.id, { text: e.target.value }); setEditingId(prev => prev === node.id ? null : prev); }}
+                                                    onChange={(e) => {
+                                                        const text = e.currentTarget.value;
+                                                        const width = !node.autoWidth
+                                                            ? node.width || DEFAULT_W
+                                                            : getAutoNodeWidth(text);
+                                                        setNodes((previous) => previous.map((item) => item.id === node.id ? { ...item, width } : item));
+                                                    }}
+                                                    onKeyDown={(e) => {
+                                                        if (e.key === 'Enter' && !e.shiftKey) {
+                                                            e.preventDefault();
+                                                            updateNodeProps(node.id, { text: e.currentTarget.value });
+                                                            if (e.ctrlKey || e.metaKey) {
+                                                                const parentNode = nodes.find(n => n.id === node.parentId);
+                                                                createNode(parentNode ? parentNode.parentId : null, '', 'text');
+                                                            } else {
+                                                                createNode(node.parentId, '', 'text');
+                                                            }
+                                                        } else if (e.key === 'Tab') {
+                                                            e.preventDefault();
+                                                            updateNodeProps(node.id, { text: e.currentTarget.value });
+                                                            createNode(node.id, '', 'text');
+                                                        } else if (e.key === 'Escape') {
+                                                            setEditingId(null);
                                                         }
-                                                    } else if (e.key === 'Tab') {
-                                                        // Tab: Tạo nhánh con (Child)
-                                                        e.preventDefault();
-                                                        updateNodeProps(node.id, { text: e.currentTarget.value });
-                                                        createNode(node.id, '', 'text');
-                                                    } else if (e.key === 'Escape') {
-                                                        setEditingId(null);
-                                                    }
-                                                }}
-                                                className={`w-full bg-transparent text-[15px] font-semibold outline-none resize-none overflow-hidden ${isRoot && !node.color ? 'text-white' : 'text-[#201F2E]'}`}
-                                                style={{ minHeight: '40px', fieldSizing: 'content', userSelect: 'text', textAlign: node.textAlign } as React.CSSProperties}
-                                            />
-                                        ) : (
-                                            <p className="whitespace-pre-wrap break-words text-[15px] font-semibold w-full leading-snug" style={{ fontFamily: 'var(--font-display)', color: isRoot && !node.color ? 'white' : '#201F2E', textAlign: node.textAlign }}>
-                                                {node.text}
-                                            </p>
+                                                    }}
+                                                    className={`w-full bg-transparent text-[15px] font-semibold outline-none resize-none overflow-hidden ${isRoot && !node.color ? 'text-white' : 'text-[#201F2E]'}`}
+                                                    style={{ minHeight: '40px', fieldSizing: 'content', userSelect: 'text', textAlign: node.textAlign } as React.CSSProperties}
+                                                />
+                                            ) : (
+                                                <p className="whitespace-pre-wrap break-words text-[15px] font-semibold w-full leading-snug" style={{ fontFamily: 'var(--font-display)', color: isRoot && !node.color ? 'white' : '#201F2E', textAlign: node.textAlign }}>
+                                                    {node.text}
+                                                </p>
+                                            )}
+                                        </div>
+                                        {comparison && (
+                                            <div className="flex w-1/2 min-w-0 flex-col justify-center px-3 py-3" lang={comparison.language}>
+                                                <span className="mb-1 text-[10px] font-bold uppercase text-[#777687]">{comparison.language === 'en' ? 'English' : comparison.language === 'ja' ? '日本語' : 'Tiếng Việt'}</span>
+                                                <p className="whitespace-pre-wrap break-words text-[15px] font-semibold leading-snug text-[#201F2E]" style={{ fontFamily: 'var(--font-display)' }}>{comparison.text}</p>
+                                            </div>
                                         )}
                                     </div>
                                 )}
@@ -1198,7 +1455,41 @@ export default function MindmapPage() {
             )}
 
             {contextMenu && (
-                <div ref={contextMenuRef} style={{ position: 'fixed', left: contextMenu.x, top: contextMenu.y }} className="z-50 w-56 overflow-hidden rounded-xl border border-[#E4E4ED] bg-white py-1.5 shadow-xl text-black">
+                <div ref={contextMenuRef} style={{ position: 'fixed', left: contextMenu.x, top: contextMenu.y }} className="z-50 max-h-[calc(100vh-1rem)] w-56 overflow-y-auto rounded-xl border border-[#E4E4ED] bg-white py-1.5 shadow-xl text-black">
+                    <div className="border-y border-[#EEEDF6] px-3 py-2.5">
+                        <label className="mb-2 block text-xs font-semibold text-[#626174]" htmlFor="node-translation-language">Translate this note to</label>
+                        <select
+                            id="node-translation-language"
+                            value={translationTargetLanguage}
+                            onChange={(event) => setTranslationTargetLanguage(event.target.value as Language)}
+                            className="mb-2 h-8 w-full rounded-md border border-[#DEDCEB] bg-white px-2 text-sm text-[#333244] outline-none focus:border-[#7B61FF]"
+                        >
+                            {(['vi', 'ja', 'en'] as const).filter((language) => language !== activeLanguage).map((language) => (
+                                <option key={language} value={language}>{language === 'en' ? 'English' : language === 'ja' ? '日本語' : 'Tiếng Việt'}</option>
+                            ))}
+                        </select>
+                        <button
+                            type="button"
+                            disabled={translatingNodeId === contextMenu.nodeId}
+                            onClick={() => void toggleNodeComparison(contextMenu.nodeId, translationTargetLanguage)}
+                            className="mb-1 flex h-9 w-full items-center justify-center rounded-md bg-[#2B2A3D] px-2 text-xs font-bold text-white hover:bg-[#424153] disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                            {translatingNodeId === contextMenu.nodeId
+                                ? 'Translating…'
+                                : nodeComparisons[contextMenu.nodeId]?.language === translationTargetLanguage
+                                    ? 'Hide translation'
+                                    : 'Show translation'}
+                        </button>
+                        <button
+                            type="button"
+                            disabled={translatingNodeId === contextMenu.nodeId || !nodes.find((node) => node.id === contextMenu.nodeId)?.text.trim()}
+                            onClick={() => void translateNodeToLanguage(contextMenu.nodeId, translationTargetLanguage)}
+                            className="flex h-8 w-full items-center justify-center rounded-md px-2 text-xs font-semibold text-[#626174] hover:bg-[#F2F1FA] disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                            {translatingNodeId === contextMenu.nodeId ? 'Translating…' : 'Force retranslate'}
+                        </button>
+                    </div>
+
                     <MenuItem label="Add child idea" onClick={() => { createNode(contextMenu.nodeId, '', 'text'); setContextMenu(null); }} />
                     <MenuItem label="Rename" onClick={() => { setEditingId(contextMenu.nodeId); setContextMenu(null); }} />
 
@@ -1237,6 +1528,71 @@ export default function MindmapPage() {
 
                     <div className="my-1 h-px bg-[#EEEDF6]" />
                     <MenuItem label="Delete" danger onClick={() => { deleteNode(contextMenu.nodeId); setContextMenu(null); }} />
+
+                    <div className="mt-1 border-t border-[#EEEDF6] px-3 py-2.5">
+                        <p className="mb-2 text-[11px] font-semibold text-[#777687]">AI provider and model</p>
+                        <label htmlFor="node-ai-provider" className="sr-only">AI provider</label>
+                        <select
+                            id="node-ai-provider"
+                            value={translationProvider}
+                            onChange={(event) => {
+                                const provider = event.target.value as AIProvider;
+                                setTranslationProvider(provider);
+                                setTranslationModel(AI_MODELS[provider][0].id);
+                            }}
+                            className="mb-2 h-8 w-full rounded-md border border-[#DEDCEB] bg-white px-2 text-xs text-[#333244] outline-none focus:border-[#7B61FF]"
+                        >
+                            <option value="openai">OpenAI</option>
+                            <option value="gemini">Google Gemini</option>
+                        </select>
+                        <label htmlFor="node-ai-model" className="sr-only">AI model</label>
+                        <select
+                            id="node-ai-model"
+                            value={translationModel}
+                            onChange={(event) => setTranslationModel(event.target.value)}
+                            className="h-8 w-full rounded-md border border-[#DEDCEB] bg-white px-2 text-xs text-[#333244] outline-none focus:border-[#7B61FF]"
+                        >
+                            {AI_MODELS[translationProvider].map((model) => (
+                                <option key={model.id} value={model.id}>{model.label}</option>
+                            ))}
+                        </select>
+                    </div>
+                </div>
+            )}
+
+            {notebookContextMenu && (
+                <div ref={notebookContextMenuRef} style={{ position: 'fixed', left: notebookContextMenu.x, top: notebookContextMenu.y }} className="z-50 w-52 overflow-hidden rounded-xl border border-[#E4E4ED] bg-white py-1.5 shadow-xl text-black">
+                    <MenuItem label="Notebook description…" onClick={() => {
+                        const notebook = notebooks.find((item) => item.id === notebookContextMenu.notebookId);
+                        if (notebook) setDescriptionEditor({ notebookId: notebook.id, value: notebook.description });
+                        setNotebookContextMenu(null);
+                    }} />
+                </div>
+            )}
+
+            {descriptionEditor && (
+                <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/25 p-4" onPointerDown={(event) => { if (event.target === event.currentTarget) setDescriptionEditor(null); }}>
+                    <section role="dialog" aria-modal="true" aria-labelledby="notebook-description-title" className="w-full max-w-lg rounded-xl border border-[#E4E4ED] bg-white p-5 shadow-2xl">
+                        <h2 id="notebook-description-title" className="mb-3 text-base font-bold text-[#201F2E]">Notebook description</h2>
+                        <textarea
+                            autoFocus
+                            maxLength={2000}
+                            value={descriptionEditor.value}
+                            onChange={(event) => setDescriptionEditor({ ...descriptionEditor, value: event.target.value })}
+                            className="min-h-36 w-full resize-y rounded-lg border border-[#DEDCEB] px-3 py-2 text-sm text-[#201F2E] outline-none focus:border-[#7B61FF]"
+                        />
+                        <div className="mt-4 flex justify-end gap-2">
+                            <button onClick={() => setDescriptionEditor(null)} className="h-9 rounded-lg px-3 text-sm font-semibold text-[#626174] hover:bg-[#F2F1FA]">Cancel</button>
+                            <button onClick={() => void saveNotebookDescription()} className="h-9 rounded-lg bg-[#2B2A3D] px-4 text-sm font-semibold text-white hover:bg-[#424153]">Save</button>
+                        </div>
+                    </section>
+                </div>
+            )}
+
+            {error && (
+                <div role="alert" className="fixed bottom-5 left-1/2 z-[70] flex max-w-[min(90vw,36rem)] -translate-x-1/2 items-center gap-3 rounded-lg border border-rose-200 bg-white px-4 py-3 text-sm text-rose-800 shadow-xl">
+                    <span>{error}</span>
+                    <button type="button" aria-label="Dismiss error" onClick={() => setError(null)} className="ml-2 font-bold">×</button>
                 </div>
             )}
         </div>
