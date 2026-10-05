@@ -33,6 +33,21 @@ database.exec(`
         created_at TEXT NOT NULL,
         PRIMARY KEY (user_id, target_language, id)
     );
+    CREATE TABLE IF NOT EXISTS flashcard_srs (
+        user_id TEXT NOT NULL,
+        target_language TEXT NOT NULL CHECK (target_language IN ('en', 'ja')),
+        entry_id TEXT NOT NULL,
+        due_at TEXT NOT NULL,
+        interval_days INTEGER NOT NULL DEFAULT 0,
+        ease_factor REAL NOT NULL DEFAULT 2.5,
+        repetitions INTEGER NOT NULL DEFAULT 0,
+        lapses INTEGER NOT NULL DEFAULT 0,
+        last_reviewed_at TEXT,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (user_id, target_language, entry_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_flashcard_srs_due
+        ON flashcard_srs (user_id, target_language, due_at);
 `);
 
 type UserRow = { id: string; email: string; password_hash: string };
@@ -75,7 +90,11 @@ export function updateUserData(userId: string, field: "watchlist" | "scenarios",
 }
 
 type VocabularyLanguage = "en" | "ja";
-type StoredVocabularyEntry = { id: string };
+type StoredVocabularyEntry = { id: string; word?: string };
+
+function normalizeVocabularyWord(word: unknown) {
+    return typeof word === "string" ? word.normalize("NFKC").trim().toLocaleLowerCase() : "";
+}
 
 export function getVocabularyEntries(userId: string, language: VocabularyLanguage) {
     const rows = database.prepare(`
@@ -96,13 +115,184 @@ export function addVocabularyEntries(
             (user_id, target_language, id, entry_json, created_at)
         VALUES (?, ?, ?, ?, ?)
     `);
+    const existingRows = database.prepare(`
+        SELECT entry_json FROM vocabulary_entries
+        WHERE user_id = ? AND target_language = ?
+    `);
     const createdAt = new Date().toISOString();
     const saveEntries = database.transaction((items: StoredVocabularyEntry[]) => {
-        for (const entry of [...items].reverse()) {
-            insert.run(userId, language, entry.id, JSON.stringify(entry), createdAt);
+        const knownWords = new Set(
+            (existingRows.all(userId, language) as Array<{ entry_json: string }>).map((row) => {
+                try {
+                    return normalizeVocabularyWord((JSON.parse(row.entry_json) as { word?: unknown }).word);
+                } catch {
+                    return "";
+                }
+            }).filter(Boolean),
+        );
+        const candidates: StoredVocabularyEntry[] = [];
+        for (const entry of items) {
+            const word = normalizeVocabularyWord(entry.word);
+            if (!word || knownWords.has(word)) continue;
+            knownWords.add(word);
+            candidates.push(entry);
         }
+
+        const inserted: StoredVocabularyEntry[] = [];
+        for (const entry of candidates.reverse()) {
+            const result = insert.run(userId, language, entry.id, JSON.stringify(entry), createdAt);
+            if (result.changes > 0) inserted.push(entry);
+        }
+        return inserted.reverse();
     });
-    saveEntries(entries);
+    return saveEntries(entries);
+}
+
+export type FlashcardRating = "again" | "hard" | "good" | "easy";
+
+type FlashcardStateRow = {
+    due_at: string;
+    interval_days: number;
+    ease_factor: number;
+    repetitions: number;
+    lapses: number;
+    last_reviewed_at: string | null;
+};
+
+export function getFlashcardStudyData(userId: string, language: VocabularyLanguage, limit = 30) {
+    const now = new Date().toISOString();
+    const stats = database.prepare(`
+        SELECT
+            COUNT(*) AS total,
+            COALESCE(SUM(CASE WHEN s.entry_id IS NULL THEN 1 ELSE 0 END), 0) AS new_count,
+            COALESCE(SUM(CASE WHEN s.entry_id IS NOT NULL AND s.due_at <= ? THEN 1 ELSE 0 END), 0) AS due_count
+        FROM vocabulary_entries v
+        LEFT JOIN flashcard_srs s
+            ON s.user_id = v.user_id
+            AND s.target_language = v.target_language
+            AND s.entry_id = v.id
+        WHERE v.user_id = ? AND v.target_language = ?
+    `).get(now, userId, language) as { total: number; new_count: number; due_count: number };
+    const rows = database.prepare(`
+        SELECT v.entry_json, s.due_at, s.interval_days, s.ease_factor,
+            s.repetitions, s.lapses, s.last_reviewed_at
+        FROM vocabulary_entries v
+        LEFT JOIN flashcard_srs s
+            ON s.user_id = v.user_id
+            AND s.target_language = v.target_language
+            AND s.entry_id = v.id
+        WHERE v.user_id = ? AND v.target_language = ?
+            AND (s.entry_id IS NULL OR s.due_at <= ?)
+        ORDER BY CASE WHEN s.entry_id IS NULL THEN 1 ELSE 0 END,
+            s.due_at ASC, v.created_at DESC, v.rowid DESC
+        LIMIT ?
+    `).all(userId, language, now, limit) as Array<{
+        entry_json: string;
+        due_at: string | null;
+        interval_days: number | null;
+        ease_factor: number | null;
+        repetitions: number | null;
+        lapses: number | null;
+        last_reviewed_at: string | null;
+    }>;
+
+    return {
+        total: stats.total,
+        newCount: stats.new_count,
+        dueCount: stats.due_count,
+        cards: rows.map((row) => ({
+            entry: JSON.parse(row.entry_json) as unknown,
+            state: row.due_at === null ? null : {
+                dueAt: row.due_at,
+                intervalDays: row.interval_days ?? 0,
+                easeFactor: row.ease_factor ?? 2.5,
+                repetitions: row.repetitions ?? 0,
+                lapses: row.lapses ?? 0,
+                lastReviewedAt: row.last_reviewed_at,
+            },
+        })),
+    };
+}
+
+export function reviewFlashcard(
+    userId: string,
+    language: VocabularyLanguage,
+    entryId: string,
+    rating: FlashcardRating,
+) {
+    const review = database.transaction(() => {
+        const exists = database.prepare(`
+            SELECT 1 FROM vocabulary_entries
+            WHERE user_id = ? AND target_language = ? AND id = ?
+        `).get(userId, language, entryId);
+        if (!exists) return null;
+
+        const previous = database.prepare(`
+            SELECT due_at, interval_days, ease_factor, repetitions, lapses, last_reviewed_at
+            FROM flashcard_srs
+            WHERE user_id = ? AND target_language = ? AND entry_id = ?
+        `).get(userId, language, entryId) as FlashcardStateRow | undefined;
+        const now = new Date();
+        const nowIso = now.toISOString();
+        const oldRepetitions = previous?.repetitions ?? 0;
+        const oldInterval = previous?.interval_days ?? 0;
+        let easeFactor = previous?.ease_factor ?? 2.5;
+        let intervalDays: number;
+        let repetitions: number;
+        let lapses = previous?.lapses ?? 0;
+        let dueAt: Date;
+
+        if (rating === "again") {
+            intervalDays = 0;
+            repetitions = 0;
+            dueAt = new Date(now.getTime() + 10 * 60 * 1000);
+            if (oldRepetitions > 0) {
+                easeFactor = Math.max(1.3, easeFactor - 0.2);
+                lapses += 1;
+            }
+        } else {
+            repetitions = oldRepetitions + 1;
+            if (rating === "hard") {
+                intervalDays = oldRepetitions === 0 ? 1 : Math.max(1, Math.round(oldInterval * 1.2));
+                easeFactor = Math.max(1.3, easeFactor - 0.15);
+            } else if (rating === "good") {
+                intervalDays = oldRepetitions === 0 ? 1 : oldRepetitions === 1 ? 3 : Math.max(1, Math.round(oldInterval * easeFactor));
+            } else {
+                intervalDays = oldRepetitions === 0 ? 4 : Math.max(1, Math.round(oldInterval * easeFactor * 1.3));
+                easeFactor += 0.15;
+            }
+            dueAt = new Date(now.getTime() + intervalDays * 24 * 60 * 60 * 1000);
+        }
+
+        const schedule = {
+            dueAt: dueAt.toISOString(),
+            intervalDays,
+            easeFactor,
+            repetitions,
+            lapses,
+            lastReviewedAt: nowIso,
+        };
+        database.prepare(`
+            INSERT INTO flashcard_srs
+                (user_id, target_language, entry_id, due_at, interval_days, ease_factor,
+                    repetitions, lapses, last_reviewed_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (user_id, target_language, entry_id) DO UPDATE SET
+                due_at = excluded.due_at,
+                interval_days = excluded.interval_days,
+                ease_factor = excluded.ease_factor,
+                repetitions = excluded.repetitions,
+                lapses = excluded.lapses,
+                last_reviewed_at = excluded.last_reviewed_at,
+                updated_at = excluded.updated_at
+        `).run(
+            userId, language, entryId, schedule.dueAt, intervalDays, easeFactor,
+            repetitions, lapses, nowIso, nowIso,
+        );
+        return schedule;
+    });
+
+    return review();
 }
 
 export function updateVocabularyEntry(
@@ -117,8 +307,14 @@ export function updateVocabularyEntry(
 }
 
 export function deleteVocabularyEntry(userId: string, language: VocabularyLanguage, id: string) {
-    return database.prepare(`
-        DELETE FROM vocabulary_entries
-        WHERE user_id = ? AND target_language = ? AND id = ?
-    `).run(userId, language, id).changes > 0;
+    return database.transaction(() => {
+        database.prepare(`
+            DELETE FROM flashcard_srs
+            WHERE user_id = ? AND target_language = ? AND entry_id = ?
+        `).run(userId, language, id);
+        return database.prepare(`
+            DELETE FROM vocabulary_entries
+            WHERE user_id = ? AND target_language = ? AND id = ?
+        `).run(userId, language, id).changes > 0;
+    })();
 }

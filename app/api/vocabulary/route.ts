@@ -75,9 +75,10 @@ function normalizeEntries(
 
 function makePrompt(text: string, language: Language) {
     const rules = language === "ja"
-        ? "Extract useful Japanese vocabulary. Use dictionary form (jisho-kei) for verbs and base form for adjectives. For words containing Kanji, phonetic must be the full Hiragana reading. For words without Kanji, phonetic must be empty."
-        : "Extract useful English vocabulary in its lemma/base form and use standard IPA for phonetic.";
+        ? "Extract useful Japanese vocabulary. Every headword MUST be in dictionary form: verbs in jisho-kei (e.g. 食べました → 食べる), い-adjectives in their plain base form (e.g. 高かった → 高い), and な-adjectives/nouns in their lexical form. Never use polite, past, negative, or other inflected forms as the headword. If the input explicitly supplies one or more words, return an entry for each word and normalize each to its dictionary form; do not omit any supplied word. For words containing Kanji, phonetic must be the full Hiragana reading. For words without Kanji, phonetic must be empty."
+        : "Extract useful English vocabulary. Every headword MUST be the lemma/base form: singular nouns (children → child), base verbs (went/going → go), and positive base adjectives (better → good when used as an adjective). Never use plural, tense, participle, comparative, or superlative forms as the headword. If the input explicitly supplies one or more words, return an entry for each word and normalize each to its lemma; do not omit any supplied word. Use standard IPA for phonetic.";
     return `You are an expert bilingual vocabulary tutor. ${rules}
+Treat the user's input as the source of the requested vocabulary, not as a suggestion. Preserve the identity of every explicitly requested word while converting its form to the required dictionary form. For a passage, extract useful vocabulary from the passage and write every extracted headword in dictionary form.
 For every word, return its 1–4 most common distinct Vietnamese meanings, ordered by frequency and separated by semicolons. Do not collapse different senses into one vague definition. Write partOfSpeech in Vietnamese. Add a concise but useful Vietnamese description explaining typical contexts/register/collocations, useful near-synonyms and how they differ, and common confusions when relevant.
 Return exactly two example objects with sentence and translation strings. If the word has several meanings, illustrate its two most common meanings with one example each. If it has one main meaning, use two varied natural contexts. For a passage, reuse a complete sentence from the input as the first example when possible, then create a second example. Translate both examples into Vietnamese. For a single word, create both examples. Return JSON only: an object with an entries array; every entry has string fields word, phonetic, partOfSpeech, meaning, description, and an examples array of exactly two objects with sentence and translation.
 
@@ -162,8 +163,8 @@ export async function PUT(request: Request) {
     }
     try {
         const entries = normalizeEntries(body.entries, language, true, 1000);
-        addVocabularyEntries(user.user_id, language, entries);
-        return NextResponse.json({ imported: entries.length });
+        const imported = addVocabularyEntries(user.user_id, language, entries);
+        return NextResponse.json({ imported: imported.length });
     } catch {
         return NextResponse.json({ error: "Không thể nhập dữ liệu từ thiết bị." }, { status: 400 });
     }
@@ -248,8 +249,8 @@ export async function POST(request: Request) {
         if (!vocabulary.length) {
             return NextResponse.json({ error: "Không tìm thấy từ vựng phù hợp." }, { status: 422 });
         }
-        addVocabularyEntries(user.user_id, language, vocabulary);
-        return NextResponse.json({ vocabulary });
+        const addedVocabulary = addVocabularyEntries(user.user_id, language, vocabulary);
+        return NextResponse.json({ vocabulary: addedVocabulary });
     } catch (error) {
         console.error("Vocabulary generation failed:", error);
         return NextResponse.json({

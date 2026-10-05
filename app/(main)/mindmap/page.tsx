@@ -8,6 +8,10 @@ import {
     type PointerEvent as ReactPointerEvent,
 } from 'react';
 import { Manrope, Inter } from 'next/font/google';
+import { useCreateBlockNote } from '@blocknote/react';
+import { BlockNoteView } from '@blocknote/mantine';
+import '@blocknote/core/fonts/inter.css';
+import '@blocknote/mantine/style.css';
 
 const manrope = Manrope({ subsets: ['latin'], weight: ['600', '700', '800'], variable: '--font-display' });
 const inter = Inter({ subsets: ['latin'], weight: ['400', '500', '600'], variable: '--font-ui' });
@@ -190,6 +194,34 @@ function getVisibleNodes(nodes: MindNode[], collapsedIds: Set<string>) {
     });
 }
 
+function buildDocumentBlocks(nodes: MindNode[]) {
+    const childrenByParent = buildChildrenMap(nodes);
+
+    function buildBlock(node: MindNode): Record<string, unknown> {
+        const children = childrenByParent.get(node.id) ?? [];
+        const text = node.text.trim() || (node.imageUrl ? 'Image attachment' : 'Untitled idea');
+        const block: Record<string, unknown> = {
+            id: node.id,
+            type: children.length > 0 ? 'toggleListItem' : 'bulletListItem',
+            content: [{ type: 'text', text }],
+        };
+        const nestedBlocks = children.map(buildBlock);
+
+        if (node.imageUrl) {
+            nestedBlocks.unshift({
+                id: `${node.id}-image`,
+                type: 'image',
+                props: { url: node.imageUrl, name: text, previewWidth: Math.min(node.width, 640) },
+            });
+        }
+
+        if (nestedBlocks.length > 0) block.children = nestedBlocks;
+        return block;
+    }
+
+    return (childrenByParent.get(null) ?? []).map(buildBlock);
+}
+
 export default function MindmapPage() {
     const [notebooks, setNotebooks] = useState<Notebook[]>([]);
     const [notebookGroups, setNotebookGroups] = useState<NotebookGroup[]>([]);
@@ -222,6 +254,7 @@ export default function MindmapPage() {
     const [zoom, setZoom] = useState(1);
     const [pan, setPan] = useState(DEFAULT_PAN);
     const [autoFormat, setAutoFormat] = useState(true);
+    const [viewMode, setViewMode] = useState<'map' | 'document'>('map');
     const [boardActive, setBoardActive] = useState(false);
     const [collapsedNodeIds, setCollapsedNodeIds] = useState<Set<string>>(new Set());
     const [dropTargetId, setDropTargetId] = useState<string | null>(null);
@@ -263,6 +296,7 @@ export default function MindmapPage() {
 
     useEffect(() => {
         const handleWindowWheel = (event: WheelEvent) => {
+            if (viewMode !== 'map') return;
             const target = event.target as Node | null;
             const rect = containerRef.current?.getBoundingClientRect();
             if (!rect) return;
@@ -288,7 +322,7 @@ export default function MindmapPage() {
 
         window.addEventListener('wheel', handleWindowWheel, { capture: true, passive: false });
         return () => window.removeEventListener('wheel', handleWindowWheel, true);
-    }, [activeNotebookId]);
+    }, [activeNotebookId, viewMode]);
 
     const visibleNodes = getVisibleNodes(nodes, collapsedNodeIds);
     const edges = useMemo(() => {
@@ -374,13 +408,20 @@ export default function MindmapPage() {
             } else if (e.key === 'F2') {
                 e.preventDefault();
                 setEditingId(node.id);
+            } else if (e.key.toLowerCase() === 't' && !e.altKey && !e.ctrlKey && !e.metaKey) {
+                e.preventDefault();
+                const language = nodeComparisons[node.id]?.language
+                    ?? (translationTargetLanguage !== activeLanguage
+                        ? translationTargetLanguage
+                        : (['vi', 'ja', 'en'] as const).find((candidate) => candidate !== activeLanguage)!);
+                void toggleNodeComparison(node.id, language);
             } else if (e.key === 'Delete' || e.key === 'Backspace') {
                 deleteNode(node.id);
             }
         };
         window.addEventListener('keydown', handleKeyDown);
         return () => window.removeEventListener('keydown', handleKeyDown);
-    }, [selectedId, editingId, nodes, activeNotebookId, pan, zoom]);
+    }, [selectedId, editingId, nodes, activeNotebookId, pan, zoom, nodeComparisons, translationTargetLanguage, activeLanguage]);
 
     useEffect(() => {
         if (!contextMenu) return;
@@ -440,7 +481,7 @@ export default function MindmapPage() {
                             method: 'POST', headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({ resource: 'upload', base64 })
                         });
-                        updateNodeProps(selectedNode.id, {
+                        await updateNodeProps(selectedNode.id, {
                             type: 'image', imageUrl: url, width: Math.max(selectedNode.width || DEFAULT_W, width),
                             height, preserveAspect: true,
                         });
@@ -525,9 +566,15 @@ export default function MindmapPage() {
 
     function reflowComparedNodes() {
         window.requestAnimationFrame(() => {
-            const arranged = formatVisibleTree(nodesRef.current, collapsedNodeIds);
-            setNodes(arranged);
-            persistPositions(arranged);
+            window.requestAnimationFrame(() => {
+                const arranged = formatVisibleTree(nodesRef.current, collapsedNodeIds);
+                const positions = new Map(arranged.map((node) => [node.id, { x: node.x, y: node.y }]));
+                setNodes((current) => current.map((node) => {
+                    const position = positions.get(node.id);
+                    return position ? { ...node, ...position } : node;
+                }));
+                persistPositions(arranged);
+            });
         });
     }
 
@@ -805,7 +852,7 @@ export default function MindmapPage() {
         apiFetch(`${API_BASE}?resource=node&id=${id}`, { method: 'DELETE' });
     }
 
-    function updateNodeProps(id: string, updates: Partial<MindNode>) {
+    async function updateNodeProps(id: string, updates: Partial<MindNode>) {
         const currentNode = nodesRef.current.find((node) => node.id === id);
         const textChanged = typeof updates.text === 'string' && updates.text !== currentNode?.text;
         const savedUpdates = updates.text !== undefined && currentNode?.autoWidth
@@ -824,15 +871,25 @@ export default function MindmapPage() {
         }
         const apiUpdates = { ...savedUpdates };
         if (!textChanged) delete apiUpdates.text;
-        void apiFetch(`${API_BASE}`, {
-            method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ resource: 'node', id, ...apiUpdates, ...(textChanged ? { language: activeLanguage } : {}) }),
-        }).catch(() => setError('Could not save this node.'));
+        try {
+            await apiFetch(`${API_BASE}`, {
+                method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ resource: 'node', id, ...apiUpdates, ...(textChanged ? { language: activeLanguage } : {}) }),
+            });
+        } catch {
+            setError('Could not save this node.');
+        }
         if ((savedUpdates.text !== undefined || savedUpdates.width !== undefined || savedUpdates.height !== undefined) && autoFormat) {
             window.requestAnimationFrame(() => {
-                const laidOut = formatVisibleTree(nodesRef.current, collapsedNodeIds);
-                setNodes(laidOut);
-                persistPositions(laidOut);
+                window.requestAnimationFrame(() => {
+                    const laidOut = formatVisibleTree(nodesRef.current, collapsedNodeIds);
+                    const positions = new Map(laidOut.map((node) => [node.id, { x: node.x, y: node.y }]));
+                    setNodes((current) => current.map((node) => {
+                        const position = positions.get(node.id);
+                        return position ? { ...node, ...position } : node;
+                    }));
+                    persistPositions(laidOut);
+                });
             });
         }
     }
@@ -1006,6 +1063,7 @@ export default function MindmapPage() {
     }
 
     function handleCanvasPointerDown(e: ReactPointerEvent<HTMLDivElement>) {
+        if (viewMode !== 'map') return;
         if (e.pointerType !== 'touch' || editingId) return;
         if (e.target instanceof HTMLElement && e.target.closest('[data-canvas-controls]')) return;
 
@@ -1023,6 +1081,7 @@ export default function MindmapPage() {
     }
 
     function handleCanvasPointerMove(e: ReactPointerEvent<HTMLDivElement>) {
+        if (viewMode !== 'map') return;
         if (e.pointerType !== 'touch' || !touchPointersRef.current.has(e.pointerId)) return;
         touchPointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
         if (!pinchRef.current || touchPointersRef.current.size < 2) return;
@@ -1049,6 +1108,7 @@ export default function MindmapPage() {
     }
 
     function handleCanvasPointerEnd(e: ReactPointerEvent<HTMLDivElement>) {
+        if (viewMode !== 'map') return;
         if (e.pointerType !== 'touch') return;
         touchPointersRef.current.delete(e.pointerId);
         if (touchPointersRef.current.size < 2) pinchRef.current = null;
@@ -1056,11 +1116,13 @@ export default function MindmapPage() {
     }
 
     function handleBackgroundPointerDown(e: ReactPointerEvent<HTMLDivElement>) {
+        if (viewMode !== 'map') return;
         if (e.target !== e.currentTarget) return;
         if (e.pointerType === 'touch' && touchPointersRef.current.size > 1) return;
         panRef.current.panning = true; (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId); setSelectedId(null);
     }
     function handleBackgroundPointerMove(e: ReactPointerEvent<HTMLDivElement>) {
+        if (viewMode !== 'map') return;
         if (!panRef.current.panning) return;
         const { zoom: currentZoom, pan: currentPan } = viewRef.current;
         setCanvasView(currentZoom, { x: currentPan.x + e.movementX, y: currentPan.y + e.movementY });
@@ -1247,14 +1309,14 @@ export default function MindmapPage() {
 
             <main
                 ref={containerRef}
-                className="relative flex-1 overflow-hidden select-none"
+                className={`relative flex-1 select-none ${viewMode === 'map' ? 'overflow-hidden' : 'overflow-y-auto bg-[#F8F8F6]'}`}
                 style={{
                     height: '100%',
-                    backgroundImage: 'linear-gradient(to right, #E4E4ED66 1px, transparent 1px), linear-gradient(to bottom, #E4E4ED66 1px, transparent 1px)',
+                    backgroundImage: viewMode === 'map' ? 'linear-gradient(to right, #E4E4ED66 1px, transparent 1px), linear-gradient(to bottom, #E4E4ED66 1px, transparent 1px)' : 'none',
                     backgroundSize: `${40 * zoom}px ${40 * zoom}px`,
                     backgroundPosition: `${pan.x}px ${pan.y}px`,
-                    touchAction: 'none',
-                    overflow: 'hidden',
+                    touchAction: viewMode === 'map' ? 'none' : 'auto',
+                    overflow: viewMode === 'map' ? 'hidden' : 'auto',
                     overscrollBehavior: 'none',
                 }}
                 onContextMenu={(e) => e.preventDefault()}
@@ -1273,9 +1335,13 @@ export default function MindmapPage() {
                     <button onClick={() => createNode(null, '', 'text')} disabled={!activeNotebookId} className="flex h-10 flex-shrink-0 items-center justify-center gap-1.5 rounded-xl bg-[#7B61FF] px-4 font-bold text-sm text-white shadow hover:bg-[#6A4FF5] transition-colors disabled:cursor-not-allowed disabled:opacity-40">
                         <PlusIcon /> Add
                     </button>
-                    <button onClick={rearrangeAll} disabled={!activeNotebookId} className="flex h-10 flex-shrink-0 items-center justify-center gap-1.5 rounded-xl bg-white border border-[#E4E4ED] px-4 font-bold text-sm text-[#4B4A5C] shadow-sm hover:bg-[#F2F1FA] transition-colors disabled:cursor-not-allowed disabled:opacity-40">
+                    <div role="group" aria-label="Mindmap view" className="flex h-10 flex-shrink-0 items-center rounded-xl border border-[#E4E4ED] bg-white p-1 shadow-sm">
+                        <button type="button" aria-pressed={viewMode === 'map'} onClick={() => setViewMode('map')} className={`h-8 rounded-lg px-3 text-sm font-semibold transition-colors ${viewMode === 'map' ? 'bg-[#2B2A3D] text-white' : 'text-[#626174] hover:bg-[#F2F1FA]'}`}>Map</button>
+                        <button type="button" aria-pressed={viewMode === 'document'} onClick={() => setViewMode('document')} className={`h-8 rounded-lg px-3 text-sm font-semibold transition-colors ${viewMode === 'document' ? 'bg-[#2B2A3D] text-white' : 'text-[#626174] hover:bg-[#F2F1FA]'}`}>Document</button>
+                    </div>
+                    {viewMode === 'map' && <button onClick={rearrangeAll} disabled={!activeNotebookId} className="flex h-10 flex-shrink-0 items-center justify-center gap-1.5 rounded-xl bg-white border border-[#E4E4ED] px-4 font-bold text-sm text-[#4B4A5C] shadow-sm hover:bg-[#F2F1FA] transition-colors disabled:cursor-not-allowed disabled:opacity-40">
                         <SparkleIcon /> Re-arrange
-                    </button>
+                    </button>}
                     <select
                         aria-label="Board language"
                         value={activeLanguage}
@@ -1308,7 +1374,7 @@ export default function MindmapPage() {
                     >
                         <SparkleIcon /> Force retranslate ({forceTranslationCount})
                     </button>
-                    <label className="flex items-center gap-2 rounded-xl border border-[#E4E4ED] bg-white px-3 py-2 text-xs font-semibold text-[#4B4A5C] shadow-sm">
+                    {viewMode === 'map' && <label className="flex items-center gap-2 rounded-xl border border-[#E4E4ED] bg-white px-3 py-2 text-xs font-semibold text-[#4B4A5C] shadow-sm">
                         <span>Auto format</span>
                         <button
                             type="button"
@@ -1317,8 +1383,8 @@ export default function MindmapPage() {
                             className={`relative h-6 w-11 flex-shrink-0 rounded-full transition-colors ${autoFormat ? 'bg-[#7B61FF]' : 'bg-[#D9D7E6]'}`}>
                             <span className={`absolute top-1 left-0 h-4 w-4 rounded-full bg-white transition-transform ${autoFormat ? 'translate-x-6' : 'translate-x-1'}`} />
                         </button>
-                    </label>
-                    <div className="flex h-10 flex-shrink-0 items-center gap-1 rounded-xl bg-white border border-[#E4E4ED] px-2 shadow-sm text-[#4B4A5C]">
+                    </label>}
+                    {viewMode === 'map' && <div className="flex h-10 flex-shrink-0 items-center gap-1 rounded-xl bg-white border border-[#E4E4ED] px-2 shadow-sm text-[#4B4A5C]">
                         <button onClick={() => zoomBy(-0.1)} className="flex h-7 w-7 items-center justify-center rounded-lg text-base font-medium hover:bg-[#F2F1FA]">−</button>
                         <span className="min-w-[46px] text-center text-xs font-bold text-[#8A8A9A]">{Math.round(zoom * 100)}%</span>
                         <button
@@ -1331,10 +1397,12 @@ export default function MindmapPage() {
                             <CenterIcon />
                         </button>
                         <button onClick={() => zoomBy(0.1)} className="flex h-7 w-7 items-center justify-center rounded-lg text-base font-medium hover:bg-[#F2F1FA]">+</button>
-                    </div>
+                    </div>}
                 </div>
 
-                <div className="absolute left-0 top-0" style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`, transformOrigin: '0 0' }}>
+                {viewMode === 'document' ? (
+                    <MindmapDocumentView notebook={activeNotebook} nodes={nodes} loading={loadingNodes} />
+                ) : <div className="absolute left-0 top-0" style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`, transformOrigin: '0 0' }}>
                     <svg style={{ position: 'absolute', left: 0, top: 0, width: 6000, height: 4000, overflow: 'visible', pointerEvents: 'none' }}>
                         {edges.map((edge) => <path key={edge.id} d={edge.d} fill="none" stroke="#B9AEFF" strokeWidth={2.5} strokeLinecap="round" />)}
                     </svg>
@@ -1444,7 +1512,7 @@ export default function MindmapPage() {
                             </div>
                         );
                     })}
-                </div>
+                </div>}
             </main>
 
             {recentlyDeletedNotebook && (
@@ -1595,6 +1663,41 @@ export default function MindmapPage() {
                     <button type="button" aria-label="Dismiss error" onClick={() => setError(null)} className="ml-2 font-bold">×</button>
                 </div>
             )}
+        </div>
+    );
+}
+
+function MindmapDocumentView({ notebook, nodes, loading }: { notebook: Notebook | null; nodes: MindNode[]; loading: boolean }) {
+    const blocks = useMemo(() => buildDocumentBlocks(nodes), [nodes]);
+    const initialContent = blocks.length > 0 ? blocks : [{ type: 'paragraph', content: [] }];
+    const editor = useCreateBlockNote({ initialContent: initialContent as any }, [notebook?.id]);
+
+    useEffect(() => {
+        const nextContent = initialContent as any;
+        if (JSON.stringify(editor.document) !== JSON.stringify(nextContent)) {
+            editor.replaceBlocks(editor.document, nextContent);
+        }
+    }, [editor, initialContent]);
+
+    return (
+        <div className="min-h-full px-4 pb-16 pt-20 sm:px-8">
+            <article className="mx-auto min-h-[calc(100vh-6rem)] w-full max-w-4xl bg-white px-5 py-8 shadow-sm sm:px-12 sm:py-12">
+                <header className="mb-8 border-b border-[#E9E7E1] pb-6">
+                    <p className="mb-2 text-xs font-bold uppercase text-[#8B7960]">Mindmap document</p>
+                    <h1 className="text-2xl font-bold text-[#25251F]" style={{ fontFamily: 'var(--font-display)' }}>{notebook?.title ?? 'Mindmap'}</h1>
+                    {notebook?.description && <p className="mt-3 whitespace-pre-wrap text-sm leading-6 text-[#68675F]">{notebook.description}</p>}
+                    <p className="mt-3 text-xs text-[#939187]">{nodes.length} {nodes.length === 1 ? 'idea' : 'ideas'}</p>
+                </header>
+                {loading ? (
+                    <p className="text-sm text-[#77766E]">Loading ideas…</p>
+                ) : nodes.length === 0 ? (
+                    <p className="text-sm text-[#77766E]">No ideas in this notebook yet.</p>
+                ) : (
+                    <div className="mindmap-document-editor [&_.bn-container]:border-0 [&_.bn-container]:bg-transparent [&_.bn-editor]:min-h-0 [&_.bn-editor]:bg-transparent [&_.bn-editor]:px-0 [&_.bn-editor]:py-2">
+                        <BlockNoteView editor={editor} theme="light" editable={false} />
+                    </div>
+                )}
+            </article>
         </div>
     );
 }

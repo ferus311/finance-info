@@ -206,6 +206,10 @@ const VocabularyPage = () => {
             const payload = await response.json() as { vocabulary?: VocabularyEntry[]; error?: string };
             if (!response.ok) throw new Error(payload.error || "Không thể tra từ lúc này.");
             const newEntries = payload.vocabulary ?? [];
+            if (!newEntries.length) {
+                messageApi.info("Các từ này đã có trong sổ, không thêm mục trùng.");
+                return;
+            }
             setEntries((current) => ({
                 ...current,
                 [language]: [...newEntries, ...current[language]],
