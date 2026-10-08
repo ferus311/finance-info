@@ -1,6 +1,7 @@
 'use client';
 
 import {
+    useCallback,
     useEffect,
     useMemo,
     useRef,
@@ -8,10 +9,7 @@ import {
     type PointerEvent as ReactPointerEvent,
 } from 'react';
 import { Manrope, Inter } from 'next/font/google';
-import { useCreateBlockNote } from '@blocknote/react';
-import { BlockNoteView } from '@blocknote/mantine';
-import '@blocknote/core/fonts/inter.css';
-import '@blocknote/mantine/style.css';
+import MindmapDocumentView, { type MindmapDocumentActions } from './mindmap-document-view';
 
 const manrope = Manrope({ subsets: ['latin'], weight: ['600', '700', '800'], variable: '--font-display' });
 const inter = Inter({ subsets: ['latin'], weight: ['400', '500', '600'], variable: '--font-ui' });
@@ -67,7 +65,7 @@ function mapMindNode(node: MindNodeResponse): MindNode {
 const DEFAULT_W = 208, DEFAULT_H = 60;
 const MAX_AUTO_NODE_W = 400;
 const LEVEL_GAP_X = 64, SIBLING_GAP = 28, TREE_GAP = 64;
-const MIN_ZOOM = 0.2, MAX_ZOOM = 3, DEFAULT_PAN = { x: 160, y: 180 };
+const MIN_ZOOM = 0.05, MAX_ZOOM = 3, DEFAULT_PAN = { x: 160, y: 180 };
 const NODE_COLORS = ['#FFFFFF', '#FFEFE5', '#E5F4FF', '#EAFCE9', '#F4E5FF', '#FFF0F0'];
 
 function getAutoNodeWidth(text: string) {
@@ -194,34 +192,6 @@ function getVisibleNodes(nodes: MindNode[], collapsedIds: Set<string>) {
     });
 }
 
-function buildDocumentBlocks(nodes: MindNode[]) {
-    const childrenByParent = buildChildrenMap(nodes);
-
-    function buildBlock(node: MindNode): Record<string, unknown> {
-        const children = childrenByParent.get(node.id) ?? [];
-        const text = node.text.trim() || (node.imageUrl ? 'Image attachment' : 'Untitled idea');
-        const block: Record<string, unknown> = {
-            id: node.id,
-            type: children.length > 0 ? 'toggleListItem' : 'bulletListItem',
-            content: [{ type: 'text', text }],
-        };
-        const nestedBlocks = children.map(buildBlock);
-
-        if (node.imageUrl) {
-            nestedBlocks.unshift({
-                id: `${node.id}-image`,
-                type: 'image',
-                props: { url: node.imageUrl, name: text, previewWidth: Math.min(node.width, 640) },
-            });
-        }
-
-        if (nestedBlocks.length > 0) block.children = nestedBlocks;
-        return block;
-    }
-
-    return (childrenByParent.get(null) ?? []).map(buildBlock);
-}
-
 export default function MindmapPage() {
     const [notebooks, setNotebooks] = useState<Notebook[]>([]);
     const [notebookGroups, setNotebookGroups] = useState<NotebookGroup[]>([]);
@@ -255,6 +225,8 @@ export default function MindmapPage() {
     const [pan, setPan] = useState(DEFAULT_PAN);
     const [autoFormat, setAutoFormat] = useState(true);
     const [viewMode, setViewMode] = useState<'map' | 'document'>('map');
+    const [isDocumentEditing, setIsDocumentEditing] = useState(false);
+    const [isDocumentSaving, setIsDocumentSaving] = useState(false);
     const [boardActive, setBoardActive] = useState(false);
     const [collapsedNodeIds, setCollapsedNodeIds] = useState<Set<string>>(new Set());
     const [dropTargetId, setDropTargetId] = useState<string | null>(null);
@@ -262,6 +234,7 @@ export default function MindmapPage() {
     const containerRef = useRef<HTMLDivElement>(null);
     const contextMenuRef = useRef<HTMLDivElement>(null);
     const notebookContextMenuRef = useRef<HTMLDivElement>(null);
+    const documentActionsRef = useRef<MindmapDocumentActions>(null);
     const translationBusyRef = useRef(false);
     const panRef = useRef({ panning: false });
     const viewRef = useRef({ zoom: 1, pan: DEFAULT_PAN });
@@ -273,6 +246,8 @@ export default function MindmapPage() {
     const activeLanguage = activeNotebook?.language ?? 'vi';
     const activeViewRef = useRef({ notebookId: activeNotebookId, language: activeLanguage });
     activeViewRef.current = { notebookId: activeNotebookId, language: activeLanguage };
+    const handleDocumentEditingChange = useCallback((editing: boolean) => setIsDocumentEditing(editing), []);
+    const handleDocumentSavingChange = useCallback((saving: boolean) => setIsDocumentSaving(saving), []);
 
     useEffect(() => {
         nodesRef.current = nodes;
@@ -852,7 +827,7 @@ export default function MindmapPage() {
         apiFetch(`${API_BASE}?resource=node&id=${id}`, { method: 'DELETE' });
     }
 
-    async function updateNodeProps(id: string, updates: Partial<MindNode>) {
+    async function updateNodeProps(id: string, updates: Partial<MindNode>, options: { throwOnError?: boolean } = {}) {
         const currentNode = nodesRef.current.find((node) => node.id === id);
         const textChanged = typeof updates.text === 'string' && updates.text !== currentNode?.text;
         const savedUpdates = updates.text !== undefined && currentNode?.autoWidth
@@ -876,8 +851,9 @@ export default function MindmapPage() {
                 method: 'PATCH', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ resource: 'node', id, ...apiUpdates, ...(textChanged ? { language: activeLanguage } : {}) }),
             });
-        } catch {
+        } catch (saveError) {
             setError('Could not save this node.');
+            if (options.throwOnError) throw saveError;
         }
         if ((savedUpdates.text !== undefined || savedUpdates.width !== undefined || savedUpdates.height !== undefined) && autoFormat) {
             window.requestAnimationFrame(() => {
@@ -1042,7 +1018,11 @@ export default function MindmapPage() {
     function zoomBy(amount: number) {
         const rect = containerRef.current?.getBoundingClientRect();
         if (!rect) return;
-        zoomAtPoint(rect.left + rect.width / 2, rect.top + rect.height / 2, viewRef.current.zoom + amount);
+        const selectedNode = selectedId ? document.getElementById(`node-${selectedId}`) : null;
+        const focusRect = selectedNode?.getBoundingClientRect();
+        const focusX = focusRect ? focusRect.left + focusRect.width / 2 : rect.left + rect.width / 2;
+        const focusY = focusRect ? focusRect.top + focusRect.height / 2 : rect.top + rect.height / 2;
+        zoomAtPoint(focusX, focusY, viewRef.current.zoom + amount);
     }
 
     function centerRoot(nextZoom = viewRef.current.zoom) {
@@ -1309,7 +1289,7 @@ export default function MindmapPage() {
 
             <main
                 ref={containerRef}
-                className={`relative flex-1 select-none ${viewMode === 'map' ? 'overflow-hidden' : 'overflow-y-auto bg-[#F8F8F6]'}`}
+                className={`relative flex-1 ${viewMode === 'map' ? 'select-none overflow-hidden' : 'overflow-y-auto bg-[#F8F8F6]'}`}
                 style={{
                     height: '100%',
                     backgroundImage: viewMode === 'map' ? 'linear-gradient(to right, #E4E4ED66 1px, transparent 1px), linear-gradient(to bottom, #E4E4ED66 1px, transparent 1px)' : 'none',
@@ -1319,7 +1299,7 @@ export default function MindmapPage() {
                     overflow: viewMode === 'map' ? 'hidden' : 'auto',
                     overscrollBehavior: 'none',
                 }}
-                onContextMenu={(e) => e.preventDefault()}
+                onContextMenu={(e) => { if (viewMode === 'map') e.preventDefault(); }}
                 onPointerDown={(e: ReactPointerEvent<HTMLDivElement>) => { setBoardActive(true); handleCanvasPointerDown(e); handleBackgroundPointerDown(e); }}
                 onPointerMove={(e: ReactPointerEvent<HTMLDivElement>) => { setBoardActive(true); handleCanvasPointerMove(e); handleBackgroundPointerMove(e); }}
                 onPointerUp={(e: ReactPointerEvent<HTMLDivElement>) => { setBoardActive(true); handleCanvasPointerEnd(e); handleBackgroundPointerUp(); }}
@@ -1328,7 +1308,7 @@ export default function MindmapPage() {
                 onMouseEnter={() => setBoardActive(true)}
                 onMouseLeave={() => setBoardActive(false)}
             >
-                <div data-canvas-controls className="absolute left-4 right-4 top-4 z-10 flex items-center gap-2 overflow-x-auto pb-1">
+                <div data-canvas-controls className="sticky top-0 z-10 flex items-center gap-2 overflow-x-auto px-4 pt-4 pb-2">
                     <button onClick={() => setIsSidebarOpen(v => !v)} className="flex h-10 w-10 items-center justify-center rounded-xl bg-white border border-[#E4E4ED] shadow-sm text-[#4B4A5C] hover:bg-[#F2F1FA] transition-colors">
                         <PanelLeftIcon />
                     </button>
@@ -1339,6 +1319,55 @@ export default function MindmapPage() {
                         <button type="button" aria-pressed={viewMode === 'map'} onClick={() => setViewMode('map')} className={`h-8 rounded-lg px-3 text-sm font-semibold transition-colors ${viewMode === 'map' ? 'bg-[#2B2A3D] text-white' : 'text-[#626174] hover:bg-[#F2F1FA]'}`}>Map</button>
                         <button type="button" aria-pressed={viewMode === 'document'} onClick={() => setViewMode('document')} className={`h-8 rounded-lg px-3 text-sm font-semibold transition-colors ${viewMode === 'document' ? 'bg-[#2B2A3D] text-white' : 'text-[#626174] hover:bg-[#F2F1FA]'}`}>Document</button>
                     </div>
+                    {viewMode === 'document' && (
+                        <div role="group" aria-label="Document controls" className="flex h-10 flex-shrink-0 items-center gap-2 text-sm font-semibold text-[#4B4A5C]">
+                            <button
+                                type="button"
+                                onClick={() => documentActionsRef.current?.expandAll()}
+                                disabled={loadingNodes || nodes.length === 0}
+                                className="h-9 rounded-lg border border-[#E4E4ED] bg-white px-3 shadow-sm transition-colors hover:bg-[#F7F7FB] disabled:cursor-not-allowed disabled:opacity-40"
+                            >
+                                Expand all
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => documentActionsRef.current?.collapseAll()}
+                                disabled={loadingNodes || nodes.length === 0}
+                                className="h-9 rounded-lg border border-[#E4E4ED] bg-white px-3 shadow-sm transition-colors hover:bg-[#F7F7FB] disabled:cursor-not-allowed disabled:opacity-40"
+                            >
+                                Collapse all
+                            </button>
+                            {isDocumentEditing ? (
+                                <>
+                                    <button
+                                        type="button"
+                                        onClick={() => documentActionsRef.current?.cancelEditing()}
+                                        disabled={isDocumentSaving}
+                                        className="h-9 rounded-lg border border-[#E4E4ED] bg-white px-3 shadow-sm transition-colors hover:bg-[#F7F7FB] disabled:cursor-not-allowed disabled:opacity-40"
+                                    >
+                                        Cancel
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={() => { void documentActionsRef.current?.saveChanges(); }}
+                                        disabled={isDocumentSaving}
+                                        className="h-9 rounded-lg border border-[#2B2A3D] bg-[#2B2A3D] px-3 text-white shadow-sm transition-colors hover:bg-[#424153] disabled:cursor-not-allowed disabled:opacity-50"
+                                    >
+                                        {isDocumentSaving ? 'Saving…' : 'Save'}
+                                    </button>
+                                </>
+                            ) : (
+                                <button
+                                    type="button"
+                                    onClick={() => documentActionsRef.current?.beginEditing()}
+                                    disabled={loadingNodes || nodes.length === 0}
+                                    className="h-9 rounded-lg border border-[#E4E4ED] bg-white px-3 shadow-sm transition-colors hover:bg-[#F7F7FB] disabled:cursor-not-allowed disabled:opacity-40"
+                                >
+                                    Edit
+                                </button>
+                            )}
+                        </div>
+                    )}
                     {viewMode === 'map' && <button onClick={rearrangeAll} disabled={!activeNotebookId} className="flex h-10 flex-shrink-0 items-center justify-center gap-1.5 rounded-xl bg-white border border-[#E4E4ED] px-4 font-bold text-sm text-[#4B4A5C] shadow-sm hover:bg-[#F2F1FA] transition-colors disabled:cursor-not-allowed disabled:opacity-40">
                         <SparkleIcon /> Re-arrange
                     </button>}
@@ -1400,8 +1429,18 @@ export default function MindmapPage() {
                     </div>}
                 </div>
 
+
                 {viewMode === 'document' ? (
-                    <MindmapDocumentView notebook={activeNotebook} nodes={nodes} loading={loadingNodes} />
+                    <MindmapDocumentView
+                        ref={documentActionsRef}
+                        key={activeNotebook?.id ?? 'empty'}
+                        notebook={activeNotebook}
+                        nodes={nodes}
+                        loading={loadingNodes}
+                        onEditingChange={handleDocumentEditingChange}
+                        onSavingChange={handleDocumentSavingChange}
+                        onSaveNodeText={(id, text) => updateNodeProps(id, { text }, { throwOnError: true })}
+                    />
                 ) : <div className="absolute left-0 top-0" style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`, transformOrigin: '0 0' }}>
                     <svg style={{ position: 'absolute', left: 0, top: 0, width: 6000, height: 4000, overflow: 'visible', pointerEvents: 'none' }}>
                         {edges.map((edge) => <path key={edge.id} d={edge.d} fill="none" stroke="#B9AEFF" strokeWidth={2.5} strokeLinecap="round" />)}
@@ -1663,41 +1702,6 @@ export default function MindmapPage() {
                     <button type="button" aria-label="Dismiss error" onClick={() => setError(null)} className="ml-2 font-bold">×</button>
                 </div>
             )}
-        </div>
-    );
-}
-
-function MindmapDocumentView({ notebook, nodes, loading }: { notebook: Notebook | null; nodes: MindNode[]; loading: boolean }) {
-    const blocks = useMemo(() => buildDocumentBlocks(nodes), [nodes]);
-    const initialContent = blocks.length > 0 ? blocks : [{ type: 'paragraph', content: [] }];
-    const editor = useCreateBlockNote({ initialContent: initialContent as any }, [notebook?.id]);
-
-    useEffect(() => {
-        const nextContent = initialContent as any;
-        if (JSON.stringify(editor.document) !== JSON.stringify(nextContent)) {
-            editor.replaceBlocks(editor.document, nextContent);
-        }
-    }, [editor, initialContent]);
-
-    return (
-        <div className="min-h-full px-4 pb-16 pt-20 sm:px-8">
-            <article className="mx-auto min-h-[calc(100vh-6rem)] w-full max-w-4xl bg-white px-5 py-8 shadow-sm sm:px-12 sm:py-12">
-                <header className="mb-8 border-b border-[#E9E7E1] pb-6">
-                    <p className="mb-2 text-xs font-bold uppercase text-[#8B7960]">Mindmap document</p>
-                    <h1 className="text-2xl font-bold text-[#25251F]" style={{ fontFamily: 'var(--font-display)' }}>{notebook?.title ?? 'Mindmap'}</h1>
-                    {notebook?.description && <p className="mt-3 whitespace-pre-wrap text-sm leading-6 text-[#68675F]">{notebook.description}</p>}
-                    <p className="mt-3 text-xs text-[#939187]">{nodes.length} {nodes.length === 1 ? 'idea' : 'ideas'}</p>
-                </header>
-                {loading ? (
-                    <p className="text-sm text-[#77766E]">Loading ideas…</p>
-                ) : nodes.length === 0 ? (
-                    <p className="text-sm text-[#77766E]">No ideas in this notebook yet.</p>
-                ) : (
-                    <div className="mindmap-document-editor [&_.bn-container]:border-0 [&_.bn-container]:bg-transparent [&_.bn-editor]:min-h-0 [&_.bn-editor]:bg-transparent [&_.bn-editor]:px-0 [&_.bn-editor]:py-2">
-                        <BlockNoteView editor={editor} theme="light" editable={false} />
-                    </div>
-                )}
-            </article>
         </div>
     );
 }
