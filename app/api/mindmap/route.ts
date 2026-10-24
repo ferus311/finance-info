@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import Database from 'better-sqlite3';
 import { NextRequest, NextResponse } from 'next/server';
@@ -204,6 +204,26 @@ function getDb(): Database.Database {
     return db;
 }
 
+// Ảnh không bị xóa ngay khi xóa node (để undo còn ảnh). Dọn file không còn node nào tham chiếu và cũ hơn 24h.
+let lastImageCleanup = 0;
+function cleanupOrphanImages(db: Database.Database) {
+    const now = Date.now();
+    if (now - lastImageCleanup < 60 * 60 * 1000) return;
+    lastImageCleanup = now;
+    try {
+        const used = new Set<string>();
+        for (const row of db.prepare('SELECT image_url FROM mindmap_nodes WHERE image_url IS NOT NULL').all() as { image_url: string }[]) {
+            const match = row.image_url.match(/name=([^&]+)/);
+            if (match) used.add(decodeURIComponent(match[1]));
+        }
+        for (const file of readdirSync(IMAGE_DIR)) {
+            if (used.has(file)) continue;
+            const filePath = join(IMAGE_DIR, file);
+            try { if (now - statSync(filePath).mtimeMs > 24 * 60 * 60 * 1000) unlinkSync(filePath); } catch { }
+        }
+    } catch { }
+}
+
 function nowIso() { return new Date().toISOString(); }
 function badRequest(message: string) { return NextResponse.json({ error: message }, { status: 400 }); }
 function serverError(err: unknown) { console.error('[mindmap api]', err); return NextResponse.json({ error: 'Database error' }, { status: 500 }); }
@@ -224,6 +244,7 @@ export async function GET(req: NextRequest) {
         }
 
         if (resource === 'notebooks') {
+            cleanupOrphanImages(db);
             const rows = db.prepare(`SELECT n.* FROM mindmap_notebooks n
                 LEFT JOIN mindmap_notebook_groups g ON g.name = n.group_name
                 WHERE n.deleted_at IS NULL
@@ -491,10 +512,11 @@ export async function POST(req: NextRequest) {
             const language = isLanguage(body.language) ? body.language : 'vi';
             const cleanText = typeof text === 'string' ? text.slice(0, 10000) : '';
             const hash = sourceHash(language, cleanText);
+            const savedPreserveAspect = Number(Boolean(preserveAspect));
             const insertNode = db.transaction(() => {
                 db.prepare(`INSERT INTO mindmap_nodes (id, notebook_id, parent_id, text, x, y, type, width, height, auto_width, image_url, preserve_aspect, color, source_language, source_hash, translation_pending, translation_auto)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-                ).run(id, notebookId, parentId, cleanText, x, y, type, width, height, Number(Boolean(autoWidth)), imageUrl, preserveAspect, color, language, hash, Number(Boolean(cleanText.trim())), Number(Boolean(cleanText.trim())));
+                ).run(id, notebookId, parentId, cleanText, x, y, type, width, height, Number(Boolean(autoWidth)), imageUrl, savedPreserveAspect, color, language, hash, Number(Boolean(cleanText.trim())), Number(Boolean(cleanText.trim())));
                 if (cleanText.trim()) db.prepare('INSERT INTO mindmap_node_translations (node_id, language, text, source_hash) VALUES (?, ?, ?, ?)').run(id, language, cleanText, hash);
             });
             insertNode();
@@ -607,6 +629,62 @@ export async function PATCH(req: NextRequest) {
             return NextResponse.json({ ok: true });
         }
 
+        // Áp dụng một loạt thay đổi node (undo/redo) trong 1 transaction duy nhất
+        if (body.resource === 'nodes-apply') {
+            const notebookId = typeof body.notebookId === 'string' ? body.notebookId : '';
+            if (!notebookId) return badRequest('notebookId is required');
+            if (!db.prepare('SELECT 1 FROM mindmap_notebooks WHERE id = ? AND deleted_at IS NULL').get(notebookId)) {
+                return NextResponse.json({ error: 'Notebook not found' }, { status: 404 });
+            }
+            const upserts: Record<string, unknown>[] = Array.isArray(body.upsert) ? body.upsert.slice(0, 2000) : [];
+            const removeIds: string[] = Array.isArray(body.remove)
+                ? body.remove.filter((v: unknown): v is string => typeof v === 'string').slice(0, 2000) : [];
+            const num = (v: unknown, fallback: number) => (typeof v === 'number' && Number.isFinite(v) ? v : fallback);
+
+            const getExisting = db.prepare('SELECT notebook_id, text, source_language, translation_pending, translation_auto FROM mindmap_nodes WHERE id = ?');
+            const upsertNode = db.prepare(`INSERT INTO mindmap_nodes
+                (id, notebook_id, parent_id, text, x, y, type, width, height, auto_width, image_url, preserve_aspect, color, text_align, source_language, source_hash, translation_pending, translation_auto)
+                VALUES (@id, @notebookId, @parentId, @text, @x, @y, @type, @width, @height, @autoWidth, @imageUrl, @preserveAspect, @color, @textAlign, @language, @hash, @pending, @auto)
+                ON CONFLICT(id) DO UPDATE SET parent_id = excluded.parent_id, text = excluded.text, x = excluded.x, y = excluded.y,
+                    type = excluded.type, width = excluded.width, height = excluded.height, auto_width = excluded.auto_width,
+                    image_url = excluded.image_url, preserve_aspect = excluded.preserve_aspect, color = excluded.color,
+                    text_align = excluded.text_align, source_language = excluded.source_language, source_hash = excluded.source_hash,
+                    translation_pending = excluded.translation_pending, translation_auto = excluded.translation_auto,
+                    updated_at = datetime('now')`);
+            const upsertTranslation = db.prepare(`INSERT INTO mindmap_node_translations (node_id, language, text, source_hash, updated_at)
+                VALUES (?, ?, ?, ?, ?) ON CONFLICT(node_id, language) DO UPDATE SET
+                text = excluded.text, source_hash = excluded.source_hash, updated_at = excluded.updated_at`);
+            const removeNode = db.prepare('DELETE FROM mindmap_nodes WHERE id = ? AND notebook_id = ?');
+
+            // Thứ tự: upsert (cha trước con, client đã sort) rồi mới xóa, để node còn sống được gắn lại cha trước khi cascade.
+            db.transaction(() => {
+                for (const raw of upserts) {
+                    if (!raw || typeof raw.id !== 'string') continue;
+                    const existing = getExisting.get(raw.id) as { notebook_id: string; text: string; source_language: Language; translation_pending: number; translation_auto: number } | undefined;
+                    if (existing && existing.notebook_id !== notebookId) continue;
+                    const language: Language = isLanguage(raw.language) ? raw.language : 'vi';
+                    const text = typeof raw.text === 'string' ? raw.text.slice(0, 10000) : '';
+                    const textChanged = !existing || existing.text !== text || existing.source_language !== language;
+                    const hash = sourceHash(language, text);
+                    const nonEmpty = Number(Boolean(text.trim()));
+                    upsertNode.run({
+                        id: raw.id, notebookId, parentId: typeof raw.parentId === 'string' ? raw.parentId : null, text,
+                        x: num(raw.x, 0), y: num(raw.y, 0), type: raw.type === 'image' ? 'image' : 'text',
+                        width: num(raw.width, 208), height: num(raw.height, 60),
+                        autoWidth: Number(Boolean(raw.autoWidth)), imageUrl: typeof raw.imageUrl === 'string' ? raw.imageUrl : null,
+                        preserveAspect: Number(Boolean(raw.preserveAspect)), color: typeof raw.color === 'string' ? raw.color : null,
+                        textAlign: raw.textAlign === 'left' || raw.textAlign === 'right' ? raw.textAlign : 'center',
+                        language, hash,
+                        pending: textChanged ? nonEmpty : existing?.translation_pending ?? 0,
+                        auto: textChanged ? nonEmpty : existing?.translation_auto ?? 0,
+                    });
+                    if (textChanged && nonEmpty) upsertTranslation.run(raw.id, language, text, hash, nowIso());
+                }
+                for (const id of removeIds) removeNode.run(id, notebookId);
+            })();
+            return NextResponse.json({ ok: true });
+        }
+
         if (body.resource === 'nodes-bulk') {
             const stmt = db.prepare('UPDATE mindmap_nodes SET x = ?, y = ?, updated_at = ? WHERE id = ?');
             const applyAll = db.transaction((items: { id: string; x: number; y: number }[]) => {
@@ -655,27 +733,8 @@ export async function DELETE(req: NextRequest) {
         }
 
         if (resource === 'node') {
-            // Dùng CTE đệ quy quét Node hiện tại VÀ TOÀN BỘ các Node con/cháu của nó
-            const nodesWithImages = db.prepare(`
-        WITH RECURSIVE descendants AS (
-          SELECT id, image_url FROM mindmap_nodes WHERE id = ?
-          UNION ALL
-          SELECT n.id, n.image_url FROM mindmap_nodes n
-          INNER JOIN descendants d ON n.parent_id = d.id
-        )
-        SELECT image_url FROM descendants WHERE image_url IS NOT NULL
-      `).all(id) as { image_url: string }[];
-
-            // Xóa các file ảnh vật lý của nhánh sắp bị xóa
-            for (const node of nodesWithImages) {
-                const match = node.image_url?.match(/name=([^&]+)/);
-                if (match && match[1]) {
-                    const filePath = join(IMAGE_DIR, match[1]);
-                    if (existsSync(filePath)) try { unlinkSync(filePath); } catch (e) { }
-                }
-            }
-
-            // Xóa data trong DB (SQLite sẽ tự động Cascade xóa node con)
+            // Không unlink ảnh ở đây: undo cần ảnh còn nguyên. cleanupOrphanImages() sẽ dọn sau.
+            // SQLite tự động Cascade xóa node con.
             db.prepare('DELETE FROM mindmap_nodes WHERE id = ?').run(id);
             return NextResponse.json({ ok: true });
         }

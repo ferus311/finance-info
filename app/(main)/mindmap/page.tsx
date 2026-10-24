@@ -16,9 +16,15 @@ const inter = Inter({ subsets: ['latin'], weight: ['400', '500', '600'], variabl
 
 const API_BASE = '/api/mindmap';
 
-type Language = 'vi' | 'en' | 'ja';
+const LANGUAGES = ['vi', 'ja', 'en'] as const;
+type Language = (typeof LANGUAGES)[number];
 type AIProvider = 'openai' | 'gemini';
 type NodeComparison = { language: Language; text: string };
+
+const LANGUAGE_LABELS: Record<Language, string> = { vi: 'Tiếng Việt', ja: '日本語', en: 'English' };
+const ROOT_TEXT: Record<Language, string> = { vi: 'Ý tưởng trung tâm', ja: '中心となる考え', en: 'Central idea' };
+const otherLanguages = (language: Language) => LANGUAGES.filter((candidate) => candidate !== language);
+
 const AI_MODELS: Record<AIProvider, { id: string; label: string }[]> = {
     openai: [
         { id: 'gpt-4o-mini', label: 'GPT-4o mini' },
@@ -36,7 +42,7 @@ type SidebarDrop = { kind: 'notebook' | 'group'; id: string; position: 'before' 
 
 type MindNode = {
     id: string; notebookId: string; parentId: string | null;
-    text: string; x: number; y: number;
+    text: string; sourceText: string; sourceLanguage: Language; x: number; y: number;
     type: 'text' | 'image'; width: number; height: number; autoWidth: boolean;
     imageUrl: string | null; preserveAspect: boolean; color: string | null;
     textAlign: 'left' | 'center' | 'right';
@@ -44,7 +50,7 @@ type MindNode = {
 };
 type MindNodeResponse = {
     id: string; notebook_id: string; parent_id: string | null;
-    text: string; x: number; y: number; type?: string | null;
+    text: string; source_language?: Language; x: number; y: number; type?: string | null;
     width: number; height: number; auto_width?: number | null;
     image_url: string | null; preserve_aspect?: number | null;
     color: string | null; text_align?: 'left' | 'center' | 'right' | null;
@@ -54,11 +60,88 @@ type MindNodeResponse = {
 function mapMindNode(node: MindNodeResponse): MindNode {
     return {
         id: node.id, notebookId: node.notebook_id, parentId: node.parent_id,
-        text: node.display_text ?? node.text, x: node.x, y: node.y,
+        text: node.display_text ?? node.text, sourceText: node.text,
+        sourceLanguage: node.source_language ?? 'vi', x: node.x, y: node.y,
         type: (node.type as 'text' | 'image') || 'text', width: node.width, height: node.height,
         autoWidth: Boolean(node.auto_width ?? 1), imageUrl: node.image_url,
         preserveAspect: Boolean(node.preserve_aspect ?? 1), color: node.color,
         textAlign: node.text_align || 'center', translationPending: Boolean(node.translation_pending),
+    };
+}
+
+// ───────────────────────── History (diff-based) ─────────────────────────
+type NodeChange = { before: MindNode | null; after: MindNode | null }; // before=null: tạo mới, after=null: xóa
+type MindmapHistoryEntry = { notebookId: string; label: string; changes: NodeChange[] };
+type HistorySync = { notebookId: string; targets: Map<string, MindNode | null> };
+
+const HISTORY_LIMIT = 100;
+const HISTORY_COMMIT_DELAY = 180; // gom sửa text + tạo node + relayout thành 1 entry
+const HISTORY_SYNC_DELAY = 350;   // gom nhiều lần undo/redo liên tiếp thành 1 request
+const POSITION_SAVE_DELAY = 250;
+
+const TRACKED_FIELDS = ['parentId', 'sourceText', 'sourceLanguage', 'x', 'y', 'type', 'width', 'height', 'autoWidth', 'imageUrl', 'preserveAspect', 'color', 'textAlign'] as const;
+
+const changeId = (change: NodeChange) => (change.before ?? change.after)!.id;
+
+function nodeEquals(a: MindNode, b: MindNode) {
+    return TRACKED_FIELDS.every((key) => key === 'x' || key === 'y' ? Math.abs(a[key] - b[key]) < 0.5 : a[key] === b[key]);
+}
+
+function diffNodes(before: MindNode[], after: MindNode[]): NodeChange[] {
+    const beforeById = new Map(before.map((n) => [n.id, n]));
+    const afterById = new Map(after.map((n) => [n.id, n]));
+    const changes: NodeChange[] = [];
+    for (const node of before) {
+        const next = afterById.get(node.id);
+        if (!next) changes.push({ before: node, after: null });
+        else if (!nodeEquals(node, next)) changes.push({ before: node, after: next });
+    }
+    for (const node of after) if (!beforeById.has(node.id)) changes.push({ before: null, after: node });
+    return changes;
+}
+
+function describeChanges(changes: NodeChange[]): string {
+    const deleted = changes.filter((c) => !c.after).length;
+    if (deleted) return deleted > 1 ? `delete ${deleted} nodes` : 'delete node';
+    if (changes.some((c) => !c.before)) return 'add node';
+    const updated = changes.filter((c): c is { before: MindNode; after: MindNode } => Boolean(c.before && c.after));
+    if (updated.some(({ before, after }) => before.sourceText !== after.sourceText)) return 'edit text';
+    if (updated.some(({ before, after }) => before.parentId !== after.parentId)) return 'change parent';
+    if (updated.some(({ before, after }) => before.width !== after.width || before.height !== after.height)) return 'resize';
+    if (updated.some(({ before, after }) => before.color !== after.color || before.textAlign !== after.textAlign)) return 'format';
+    return 'move node';
+}
+
+// Giữ text đang hiển thị (có thể là bản dịch) nếu nội dung gốc không đổi.
+function restoreNode(target: MindNode, current?: MindNode): MindNode {
+    if (current && current.sourceText === target.sourceText && current.sourceLanguage === target.sourceLanguage) {
+        return { ...target, text: current.text, translationPending: current.translationPending };
+    }
+    return { ...target, text: target.sourceText, translationPending: Boolean(target.sourceText.trim()) };
+}
+
+function toSyncPayload(targets: Map<string, MindNode | null>) {
+    const depthOf = (node: MindNode) => {
+        let depth = 0, parentId = node.parentId;
+        const seen = new Set<string>();
+        while (parentId && !seen.has(parentId)) {
+            const parent = targets.get(parentId);
+            if (!parent) break;
+            seen.add(parentId); depth += 1; parentId = parent.parentId;
+        }
+        return depth;
+    };
+    const upsert: MindNode[] = [];
+    const remove: string[] = [];
+    targets.forEach((node, id) => { if (node) upsert.push(node); else remove.push(id); });
+    upsert.sort((a, b) => depthOf(a) - depthOf(b)); // cha trước con (FK)
+    return {
+        remove,
+        upsert: upsert.map((n) => ({
+            id: n.id, parentId: n.parentId, text: n.sourceText, language: n.sourceLanguage, x: n.x, y: n.y,
+            type: n.type, width: n.width, height: n.height, autoWidth: n.autoWidth, imageUrl: n.imageUrl,
+            preserveAspect: n.preserveAspect, color: n.color, textAlign: n.textAlign,
+        })),
     };
 }
 
@@ -68,13 +151,16 @@ const LEVEL_GAP_X = 64, SIBLING_GAP = 28, TREE_GAP = 64;
 const MIN_ZOOM = 0.05, MAX_ZOOM = 3, DEFAULT_PAN = { x: 160, y: 180 };
 const NODE_COLORS = ['#FFFFFF', '#FFEFE5', '#E5F4FF', '#EAFCE9', '#F4E5FF', '#FFF0F0'];
 
+// Canvas context được tạo một lần và tái sử dụng thay vì tạo mới mỗi lần đo chữ.
+let measureContext: CanvasRenderingContext2D | null | undefined;
+
 function getAutoNodeWidth(text: string) {
     if (typeof document === 'undefined') return DEFAULT_W;
-    const context = document.createElement('canvas').getContext('2d');
-    if (!context) return DEFAULT_W;
+    if (measureContext === undefined) measureContext = document.createElement('canvas').getContext('2d');
+    if (!measureContext) return DEFAULT_W;
 
-    context.font = '600 15px Manrope, sans-serif';
-    const longestLine = text.split('\n').reduce((width, line) => Math.max(width, context.measureText(line).width), 0);
+    measureContext.font = '600 15px Manrope, sans-serif';
+    const longestLine = text.split('\n').reduce((width, line) => Math.max(width, measureContext!.measureText(line).width), 0);
     return Math.max(DEFAULT_W, Math.min(MAX_AUTO_NODE_W, Math.ceil(longestLine + 40)));
 }
 
@@ -85,36 +171,41 @@ async function apiFetch(path: string, options?: RequestInit) {
     return data;
 }
 
-// LOGIC ĐỈNH: Sắp xếp các node cùng cha dựa trên TỌA ĐỘ Y HIỆN TẠI thay vì thứ tự tạo.
+// Gửi JSON tới API_BASE (POST/PATCH...) để bớt lặp code.
+function apiSend(method: 'POST' | 'PATCH', body: unknown) {
+    return apiFetch(API_BASE, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+}
+
+// Sắp xếp các node cùng cha dựa trên TỌA ĐỘ Y HIỆN TẠI thay vì thứ tự tạo.
 function buildChildrenMap(nodes: MindNode[]) {
     const map = new Map<string | null, MindNode[]>();
     for (const n of nodes) {
-        const arr = map.get(n.parentId) ?? [];
-        arr.push(n);
-        map.set(n.parentId, arr);
+        const arr = map.get(n.parentId);
+        if (arr) arr.push(n);
+        else map.set(n.parentId, [n]);
     }
-    // Sắp xếp lại mỗi nhánh theo tọa độ Y trực quan trên màn hình
     map.forEach(arr => arr.sort((a, b) => a.y - b.y));
     return map;
 }
 
 function layoutTree(nodes: MindNode[]): MindNode[] {
     const byParent = buildChildrenMap(nodes);
+    const byId = new Map(nodes.map((n) => [n.id, n]));
     const positions = new Map<string, { x: number; y: number }>();
 
-    const getRealSize = (id: string, fallbackW: number, fallbackH: number) => {
+    const getRealSize = (id: string) => {
         if (typeof document !== 'undefined') {
             const el = document.getElementById(`node-${id}`);
             if (el) return { w: el.offsetWidth, h: el.offsetHeight };
         }
-        return { w: Math.max(fallbackW, DEFAULT_W), h: Math.max(fallbackH, DEFAULT_H) };
+        const node = byId.get(id)!;
+        return { w: Math.max(node.width, DEFAULT_W), h: Math.max(node.height, DEFAULT_H) };
     };
 
     const subtreeHeight = new Map<string, number>();
     function calcSubtree(nodeId: string): number {
         const children = byParent.get(nodeId) ?? [];
-        const node = nodes.find(n => n.id === nodeId)!;
-        const size = getRealSize(nodeId, node.width, node.height);
+        const size = getRealSize(nodeId);
 
         if (children.length === 0) {
             subtreeHeight.set(nodeId, size.h);
@@ -133,13 +224,11 @@ function layoutTree(nodes: MindNode[]): MindNode[] {
     for (const root of roots) calcSubtree(root.id);
 
     function place(nodeId: string, x: number, startY: number) {
-        const node = nodes.find(n => n.id === nodeId)!;
-        const size = getRealSize(nodeId, node.width, node.height);
+        const size = getRealSize(nodeId);
         const children = byParent.get(nodeId) ?? [];
         const stHeight = subtreeHeight.get(nodeId)!;
 
-        const nodeY = startY + (stHeight / 2) - (size.h / 2);
-        positions.set(nodeId, { x, y: nodeY });
+        positions.set(nodeId, { x, y: startY + (stHeight / 2) - (size.h / 2) });
 
         let childrenTotalH = 0;
         for (const c of children) childrenTotalH += subtreeHeight.get(c.id)!;
@@ -147,17 +236,15 @@ function layoutTree(nodes: MindNode[]): MindNode[] {
 
         let childStartY = startY + (stHeight / 2) - (childrenTotalH / 2);
         for (const c of children) {
-            const cStHeight = subtreeHeight.get(c.id)!;
             place(c.id, x + size.w + LEVEL_GAP_X, childStartY);
-            childStartY += cStHeight + SIBLING_GAP;
+            childStartY += subtreeHeight.get(c.id)! + SIBLING_GAP;
         }
     }
 
     let currentY = 0;
     for (const root of roots) {
-        const h = subtreeHeight.get(root.id)!;
         place(root.id, 0, currentY);
-        currentY += h + TREE_GAP;
+        currentY += subtreeHeight.get(root.id)! + TREE_GAP;
     }
 
     return nodes.map((n) => {
@@ -166,21 +253,27 @@ function layoutTree(nodes: MindNode[]): MindNode[] {
     });
 }
 
+// Duyệt cây một lần (O(n)) thay vì lặp đến khi không còn thay đổi (O(n²)).
 function collectSubtreeIds(nodes: MindNode[], rootId: string): Set<string> {
+    const childrenOf = new Map<string, string[]>();
+    for (const n of nodes) {
+        if (!n.parentId) continue;
+        const arr = childrenOf.get(n.parentId);
+        if (arr) arr.push(n.id);
+        else childrenOf.set(n.parentId, [n.id]);
+    }
     const ids = new Set<string>([rootId]);
-    let changed = true;
-    while (changed) {
-        changed = false;
-        for (const n of nodes) {
-            if (n.parentId && ids.has(n.parentId) && !ids.has(n.id)) {
-                ids.add(n.id); changed = true;
-            }
+    const stack = [rootId];
+    while (stack.length) {
+        for (const childId of childrenOf.get(stack.pop()!) ?? []) {
+            if (!ids.has(childId)) { ids.add(childId); stack.push(childId); }
         }
     }
     return ids;
 }
 
 function getVisibleNodes(nodes: MindNode[], collapsedIds: Set<string>) {
+    if (collapsedIds.size === 0) return nodes;
     const byId = new Map(nodes.map((node) => [node.id, node]));
     return nodes.filter((node) => {
         let parentId = node.parentId;
@@ -189,6 +282,14 @@ function getVisibleNodes(nodes: MindNode[], collapsedIds: Set<string>) {
             parentId = byId.get(parentId)?.parentId ?? null;
         }
         return true;
+    });
+}
+
+function mergePositions(list: MindNode[], laidOut: MindNode[]) {
+    const positions = new Map(laidOut.map((node) => [node.id, { x: node.x, y: node.y }]));
+    return list.map((node) => {
+        const position = positions.get(node.id);
+        return position ? { ...node, ...position } : node;
     });
 }
 
@@ -216,10 +317,12 @@ export default function MindmapPage() {
     const [isTranslating, setIsTranslating] = useState(false);
     const [translatingNodeId, setTranslatingNodeId] = useState<string | null>(null);
     const [translationTargetLanguage, setTranslationTargetLanguage] = useState<Language>('en');
-    const [translationProvider, setTranslationProvider] = useState<AIProvider>('gemini');
-    const [translationModel, setTranslationModel] = useState(AI_MODELS.gemini[0].id);
+    const [translationProvider, setTranslationProvider] = useState<AIProvider>('openai');
+    const [translationModel, setTranslationModel] = useState(AI_MODELS.openai[0].id);
     const [nodeComparisons, setNodeComparisons] = useState<Record<string, NodeComparison>>({});
     const [error, setError] = useState<string | null>(null);
+    const [historyFlags, setHistoryFlags] = useState<{ undo: string | null; redo: string | null }>({ undo: null, redo: null });
+    const [historyToast, setHistoryToast] = useState<string | null>(null);
 
     const [zoom, setZoom] = useState(1);
     const [pan, setPan] = useState(DEFAULT_PAN);
@@ -242,16 +345,23 @@ export default function MindmapPage() {
     const pinchRef = useRef<{ distance: number; centerX: number; centerY: number } | null>(null);
     const dragRef = useRef<{ type: 'move' | 'resize' | null, id: string | null, startX: number, startY: number, startW: number, startH: number }>({ type: null, id: null, startX: 0, startY: 0, startW: 0, startH: 0 });
     const nodesRef = useRef<MindNode[]>([]);
+    const historyRef = useRef<{ undo: MindmapHistoryEntry[]; redo: MindmapHistoryEntry[] }>({ undo: [], redo: [] });
+    const historyActionsRef = useRef<{ undo: () => void; redo: () => void }>({ undo: () => { }, redo: () => { } });
+    const baselineRef = useRef<MindNode[]>([]);            // trạng thái đã commit gần nhất
+    const commitTimerRef = useRef<number | null>(null);
+    const syncTimerRef = useRef<number | null>(null);
+    const pendingSyncRef = useRef<HistorySync | null>(null);
+    const positionTimerRef = useRef<number | null>(null);
+    const pendingPositionsRef = useRef(new Map<string, { id: string; x: number; y: number }>());
+    const writeQueueRef = useRef<Promise<unknown>>(Promise.resolve());
+    const collapsedRef = useRef(collapsedNodeIds);
+    collapsedRef.current = collapsedNodeIds;
     const activeNotebook = notebooks.find((notebook) => notebook.id === activeNotebookId) ?? null;
     const activeLanguage = activeNotebook?.language ?? 'vi';
     const activeViewRef = useRef({ notebookId: activeNotebookId, language: activeLanguage });
     activeViewRef.current = { notebookId: activeNotebookId, language: activeLanguage };
     const handleDocumentEditingChange = useCallback((editing: boolean) => setIsDocumentEditing(editing), []);
     const handleDocumentSavingChange = useCallback((saving: boolean) => setIsDocumentSaving(saving), []);
-
-    useEffect(() => {
-        nodesRef.current = nodes;
-    }, [nodes]);
 
     useEffect(() => {
         try {
@@ -270,6 +380,19 @@ export default function MindmapPage() {
     }, [recentlyDeletedNotebook]);
 
     useEffect(() => {
+        if (!historyToast) return;
+        const id = window.setTimeout(() => setHistoryToast(null), 1800);
+        return () => window.clearTimeout(id);
+    }, [historyToast]);
+
+    // Đẩy hết dữ liệu đang debounce khi rời trang/unmount
+    useEffect(() => {
+        const flushAll = () => { commitHistory(); flushHistorySync(); flushPositions(); };
+        window.addEventListener('pagehide', flushAll);
+        return () => { window.removeEventListener('pagehide', flushAll); flushAll(); };
+    }, []);
+
+    useEffect(() => {
         const handleWindowWheel = (event: WheelEvent) => {
             if (viewMode !== 'map') return;
             const target = event.target as Node | null;
@@ -286,8 +409,18 @@ export default function MindmapPage() {
             if (target instanceof HTMLElement && target.closest('[data-canvas-controls]')) return;
 
             const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? 100 : 1;
+
             if (event.deltaY !== 0) {
-                zoomAtPoint(event.clientX, event.clientY, viewRef.current.zoom * Math.exp(-event.deltaY * unit * 0.002));
+                // Nếu deltaMode === 0 (Touchpad), dùng hệ số 0.008 (Nhanh)
+                // Nếu deltaMode khác 0 (Chuột), giữ nguyên hệ số 0.002 (Chuẩn)
+                // const zoomMultiplier = event.deltaMode === 0 ? 0.008 : 0.001;
+                const zoomMultiplier = 0.001;
+
+                zoomAtPoint(
+                    event.clientX,
+                    event.clientY,
+                    viewRef.current.zoom * Math.exp(-event.deltaY * unit * zoomMultiplier)
+                );
                 return;
             }
 
@@ -299,21 +432,49 @@ export default function MindmapPage() {
         return () => window.removeEventListener('wheel', handleWindowWheel, true);
     }, [activeNotebookId, viewMode]);
 
-    const visibleNodes = getVisibleNodes(nodes, collapsedNodeIds);
+    useEffect(() => {
+        const reset = () => {
+            dragRef.current.id = null;
+            dragRef.current.type = null;
+            panRef.current.panning = false;
+            touchPointersRef.current.clear();
+            pinchRef.current = null;
+            setDropTargetId(null);
+        };
+        window.addEventListener('pointerup', reset);
+        window.addEventListener('pointercancel', reset);
+        window.addEventListener('blur', reset);
+        return () => {
+            window.removeEventListener('pointerup', reset);
+            window.removeEventListener('pointercancel', reset);
+            window.removeEventListener('blur', reset);
+        };
+    }, []);
+
+    const visibleNodes = useMemo(() => getVisibleNodes(nodes, collapsedNodeIds), [nodes, collapsedNodeIds]);
+    const childCounts = useMemo(() => {
+        const counts = new Map<string, number>();
+        for (const node of nodes) if (node.parentId) counts.set(node.parentId, (counts.get(node.parentId) ?? 0) + 1);
+        return counts;
+    }, [nodes]);
+
     const edges = useMemo(() => {
+        const nodeById = new Map(nodes.map((node) => [node.id, node]));
         const visibleIds = new Set(visibleNodes.map((node) => node.id));
+        const hasDom = typeof document !== 'undefined';
+
         return visibleNodes.filter((n) => n.parentId && visibleIds.has(n.parentId)).map((n) => {
-            const parent = nodes.find((p) => p.id === n.parentId);
+            const parent = nodeById.get(n.parentId!);
             if (!parent) return null;
 
             let pw = parent.width || DEFAULT_W, ph = parent.height || DEFAULT_H;
-            let nw = n.width || DEFAULT_W, nh = n.height || DEFAULT_H;
+            let nh = n.height || DEFAULT_H;
 
-            if (typeof document !== 'undefined') {
+            if (hasDom) {
                 const pEl = document.getElementById(`node-${parent.id}`);
                 if (pEl) { pw = pEl.offsetWidth; ph = pEl.offsetHeight; }
                 const nEl = document.getElementById(`node-${n.id}`);
-                if (nEl) { nw = nEl.offsetWidth; nh = nEl.offsetHeight; }
+                if (nEl) nh = nEl.offsetHeight;
             }
 
             const x1 = parent.x + pw;
@@ -323,7 +484,7 @@ export default function MindmapPage() {
             const mx = x1 + (x2 - x1) / 2;
             return { id: n.id, d: `M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}` };
         }).filter((e): e is { id: string; d: string } => e !== null);
-    }, [nodes, collapsedNodeIds]);
+    }, [nodes, visibleNodes]);
 
     useEffect(() => {
         (async () => {
@@ -349,7 +510,7 @@ export default function MindmapPage() {
 
     useEffect(() => {
         if (!activeNotebookId) {
-            queueMicrotask(() => setNodes([]));
+            queueMicrotask(() => { applyNodes([]); resetHistory([]); });
             return;
         }
         let cancelled = false;
@@ -358,8 +519,8 @@ export default function MindmapPage() {
             try {
                 const data = await apiFetch(`${API_BASE}?resource=nodes&notebookId=${activeNotebookId}&language=${activeLanguage}`) as { nodes: MindNodeResponse[] };
                 if (cancelled) return;
-                const mapped: MindNode[] = data.nodes.map(mapMindNode);
-                setNodes(mapped); setPan(DEFAULT_PAN); setZoom(1);
+                const mapped = data.nodes.map(mapMindNode);
+                applyNodes(mapped); resetHistory(mapped); setPan(DEFAULT_PAN); setZoom(1);
             } catch { if (!cancelled) setError('Could not load this board.'); } finally { if (!cancelled) setLoadingNodes(false); }
         })();
         return () => { cancelled = true; };
@@ -369,6 +530,19 @@ export default function MindmapPage() {
     useEffect(() => {
         const handleKeyDown = (e: KeyboardEvent) => {
             if (e.target instanceof HTMLElement && e.target.closest('input, textarea, [contenteditable="true"]')) return;
+            const modifierPressed = e.ctrlKey || e.metaKey;
+            const key = e.key.toLowerCase();
+            if (viewMode === 'map' && modifierPressed && key === 'z') {
+                e.preventDefault();
+                if (e.shiftKey) void historyActionsRef.current.redo();
+                else void historyActionsRef.current.undo();
+                return;
+            }
+            if (viewMode === 'map' && modifierPressed && key === 'y') {
+                e.preventDefault();
+                void historyActionsRef.current.redo();
+                return;
+            }
             if (editingId || !selectedId) return; // Bỏ qua nếu đang gõ text
 
             const node = nodes.find(n => n.id === selectedId);
@@ -388,7 +562,7 @@ export default function MindmapPage() {
                 const language = nodeComparisons[node.id]?.language
                     ?? (translationTargetLanguage !== activeLanguage
                         ? translationTargetLanguage
-                        : (['vi', 'ja', 'en'] as const).find((candidate) => candidate !== activeLanguage)!);
+                        : otherLanguages(activeLanguage)[0]);
                 void toggleNodeComparison(node.id, language);
             } else if (e.key === 'Delete' || e.key === 'Backspace') {
                 deleteNode(node.id);
@@ -396,7 +570,7 @@ export default function MindmapPage() {
         };
         window.addEventListener('keydown', handleKeyDown);
         return () => window.removeEventListener('keydown', handleKeyDown);
-    }, [selectedId, editingId, nodes, activeNotebookId, pan, zoom, nodeComparisons, translationTargetLanguage, activeLanguage]);
+    }, [selectedId, editingId, nodes, activeNotebookId, pan, zoom, nodeComparisons, translationTargetLanguage, activeLanguage, viewMode]);
 
     useEffect(() => {
         if (!contextMenu) return;
@@ -452,10 +626,7 @@ export default function MindmapPage() {
                     const width = Math.round(img.width * scale);
                     const height = Math.round(img.height * scale);
                     try {
-                        const { url } = await apiFetch(`${API_BASE}`, {
-                            method: 'POST', headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ resource: 'upload', base64 })
-                        });
+                        const { url } = await apiSend('POST', { resource: 'upload', base64 });
                         await updateNodeProps(selectedNode.id, {
                             type: 'image', imageUrl: url, width: Math.max(selectedNode.width || DEFAULT_W, width),
                             height, preserveAspect: true,
@@ -470,11 +641,190 @@ export default function MindmapPage() {
         return () => window.removeEventListener('paste', handlePaste);
     }, [activeNotebookId, selectedId]);
 
+    // Luôn đi qua đây để ref và state không lệch nhau
+    function applyNodes(next: MindNode[]) {
+        nodesRef.current = next;
+        setNodes(next);
+    }
+
+    // ───── Hàng đợi ghi: thứ tự request trên server = thứ tự thao tác trên UI ─────
+    function enqueueWrite<T>(task: () => Promise<T>): Promise<T> {
+        const run = writeQueueRef.current.then(task, task);
+        writeQueueRef.current = run.then(() => undefined, () => undefined);
+        return run;
+    }
+    function queuedSend(method: 'POST' | 'PATCH', body: unknown) {
+        flushHistorySync(); // undo/redo đang chờ phải đi trước mọi thao tác mới
+        return enqueueWrite(() => apiSend(method, body));
+    }
+    function queuedDelete(url: string) {
+        flushHistorySync();
+        return enqueueWrite(() => apiFetch(url, { method: 'DELETE' }));
+    }
+
+    // ───── Lưu vị trí: gom + debounce, chỉ gửi node thực sự đổi chỗ ─────
     function persistPositions(list: MindNode[]) {
-        void apiFetch(`${API_BASE}`, {
-            method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ resource: 'nodes-bulk', nodes: list.map((n) => ({ id: n.id, x: n.x, y: n.y })) }),
-        }).catch(() => setError('Could not save node positions.'));
+        for (const n of list) pendingPositionsRef.current.set(n.id, { id: n.id, x: n.x, y: n.y });
+        if (positionTimerRef.current !== null) window.clearTimeout(positionTimerRef.current);
+        positionTimerRef.current = window.setTimeout(flushPositions, POSITION_SAVE_DELAY);
+    }
+    function flushPositions() {
+        if (positionTimerRef.current !== null) { window.clearTimeout(positionTimerRef.current); positionTimerRef.current = null; }
+        const items = [...pendingPositionsRef.current.values()];
+        if (items.length === 0) return;
+        pendingPositionsRef.current.clear();
+        void queuedSend('PATCH', { resource: 'nodes-bulk', nodes: items }).catch(() => setError('Could not save node positions.'));
+    }
+
+    // ───── History ─────
+    function syncHistoryFlags() {
+        const { undo, redo } = historyRef.current;
+        const next = { undo: undo[undo.length - 1]?.label ?? null, redo: redo[redo.length - 1]?.label ?? null };
+        setHistoryFlags((prev) => prev.undo === next.undo && prev.redo === next.redo ? prev : next);
+    }
+
+    function resetHistory(list: MindNode[]) {
+        if (commitTimerRef.current !== null) { window.clearTimeout(commitTimerRef.current); commitTimerRef.current = null; }
+        historyRef.current = { undo: [], redo: [] };
+        baselineRef.current = list;
+        syncHistoryFlags();
+    }
+
+    function scheduleHistoryCommit() {
+        if (commitTimerRef.current !== null) window.clearTimeout(commitTimerRef.current);
+        commitTimerRef.current = window.setTimeout(commitHistory, HISTORY_COMMIT_DELAY);
+    }
+
+    // So sánh baseline với trạng thái hiện tại → 1 entry duy nhất cho mọi thay đổi đã gom
+    function commitHistory() {
+        if (commitTimerRef.current !== null) { window.clearTimeout(commitTimerRef.current); commitTimerRef.current = null; }
+        const notebookId = activeViewRef.current.notebookId;
+        const current = nodesRef.current;
+        if (!notebookId || dragRef.current.id || current.some((node) => node.notebookId !== notebookId)) return;
+        const changes = diffNodes(baselineRef.current, current);
+        baselineRef.current = current;
+        if (changes.length === 0) return;
+        const { undo } = historyRef.current;
+        undo.push({ notebookId, label: describeChanges(changes), changes });
+        if (undo.length > HISTORY_LIMIT) undo.shift();
+        historyRef.current.redo = [];
+        syncHistoryFlags();
+    }
+
+    function flushHistorySync() {
+        if (syncTimerRef.current !== null) { window.clearTimeout(syncTimerRef.current); syncTimerRef.current = null; }
+        const sync = pendingSyncRef.current;
+        if (!sync || sync.targets.size === 0) return;
+        pendingSyncRef.current = null;
+        const { remove, upsert } = toSyncPayload(sync.targets);
+        void enqueueWrite(() => apiSend('PATCH', { resource: 'nodes-apply', notebookId: sync.notebookId, remove, upsert }))
+            .catch(() => { setError('Could not sync undo/redo. Reloading the board…'); void reloadActiveBoard(); });
+    }
+
+    async function reloadActiveBoard() {
+        const { notebookId, language } = activeViewRef.current;
+        if (!notebookId) return;
+        try {
+            await writeQueueRef.current;
+            const data = await apiFetch(`${API_BASE}?resource=nodes&notebookId=${notebookId}&language=${language}`) as { nodes: MindNodeResponse[] };
+            if (activeViewRef.current.notebookId !== notebookId) return;
+            const mapped = data.nodes.map(mapMindNode);
+            applyNodes(mapped);
+            resetHistory(mapped);
+        } catch { /* giữ nguyên UI hiện tại */ }
+    }
+
+    // Đưa node vào vùng nhìn nếu đang nằm ngoài màn hình
+    function revealNode(node: MindNode) {
+        const rect = containerRef.current?.getBoundingClientRect();
+        if (!rect) return;
+        const { zoom: z, pan: p } = viewRef.current;
+        const left = node.x * z + p.x, top = node.y * z + p.y;
+        const right = left + (node.width || DEFAULT_W) * z, bottom = top + (node.height || DEFAULT_H) * z;
+        const margin = 80, topMargin = 72; // chừa thanh toolbar
+        let dx = 0, dy = 0;
+        if (left < margin) dx = margin - left; else if (right > rect.width - margin) dx = rect.width - margin - right;
+        if (top < topMargin) dy = topMargin - top; else if (bottom > rect.height - margin) dy = rect.height - margin - bottom;
+        if (dx || dy) setCanvasView(z, { x: p.x + dx, y: p.y + dy });
+    }
+
+    function applyHistory(direction: 'undo' | 'redo') {
+        commitHistory(); // chốt thay đổi đang chờ trước khi đảo
+        const history = historyRef.current;
+        const entry = (direction === 'undo' ? history.undo : history.redo).pop();
+        if (!entry || entry.notebookId !== activeViewRef.current.notebookId) { syncHistoryFlags(); return; }
+
+        // Trạng thái đích của từng node trong entry (null = phải bị xóa)
+        const targets = new Map<string, MindNode | null>();
+        for (const change of entry.changes) targets.set(changeId(change), direction === 'undo' ? change.before : change.after);
+
+        const placed = new Set<string>();
+        const next: MindNode[] = [];
+        for (const node of nodesRef.current) {
+            if (!targets.has(node.id)) { next.push(node); continue; }
+            placed.add(node.id);
+            const target = targets.get(node.id);
+            if (target) next.push(restoreNode(target, node));
+        }
+        targets.forEach((target, id) => { if (target && !placed.has(id)) next.push(restoreNode(target)); });
+
+        applyNodes(next);
+        baselineRef.current = next; // undo/redo không được tính là thay đổi mới
+        (direction === 'undo' ? history.redo : history.undo).push(entry);
+        syncHistoryFlags();
+
+        // Đồng bộ server: gộp nhiều lần undo/redo liên tiếp thành 1 request
+        if (pendingSyncRef.current && pendingSyncRef.current.notebookId !== entry.notebookId) flushHistorySync();
+        const sync = pendingSyncRef.current ?? { notebookId: entry.notebookId, targets: new Map<string, MindNode | null>() };
+        targets.forEach((target, id) => { sync.targets.set(id, target); pendingPositionsRef.current.delete(id); });
+        pendingSyncRef.current = sync;
+        if (syncTimerRef.current !== null) window.clearTimeout(syncTimerRef.current);
+        syncTimerRef.current = window.setTimeout(flushHistorySync, HISTORY_SYNC_DELAY);
+
+        // UI: bỏ trạng thái cũ, chọn node liên quan, cuộn tới nó, báo toast
+        const textChangedIds = new Set(entry.changes
+            .filter((c) => c.before && c.after && c.before.sourceText !== c.after.sourceText).map(changeId));
+        if (textChangedIds.size > 0) {
+            setNodeComparisons((previous) => {
+                const rest = { ...previous };
+                textChangedIds.forEach((id) => { delete rest[id]; });
+                return rest;
+            });
+        }
+        const restored = [...targets].find(([id, target]) => target && !placed.has(id));
+        const removedChange = entry.changes.find((c) => targets.get(changeId(c)) === null);
+        const removedNode = removedChange ? (removedChange.before ?? removedChange.after) : null;
+        const focusId = restored?.[0] ?? removedNode?.parentId ?? [...targets].find(([, target]) => target)?.[0] ?? null;
+        const focus = focusId ? next.find((node) => node.id === focusId) : undefined;
+        setEditingId(null);
+        setContextMenu(null);
+        setSelectedId(focus?.id ?? null);
+        if (focus && viewMode === 'map') window.requestAnimationFrame(() => revealNode(focus));
+        setHistoryToast(`${direction === 'undo' ? 'Undo' : 'Redo'}: ${entry.label}`);
+    }
+
+    historyActionsRef.current = { undo: () => applyHistory('undo'), redo: () => applyHistory('redo') };
+
+    function persistChangedPositions(before: MindNode[], after: MindNode[]) {
+        const prev = new Map(before.map((n) => [n.id, n]));
+        const changed = after.filter((n) => {
+            const p = prev.get(n.id);
+            return !p || Math.abs(p.x - n.x) > 0.5 || Math.abs(p.y - n.y) > 0.5;
+        });
+        if (changed.length) persistPositions(changed);
+    }
+
+    // silent: layout thuần hiển thị (bật/tắt bản dịch, collapse) → không tạo entry history
+    function relayoutAfterPaint(options: { silent?: boolean } = {}) {
+        window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
+            if (options.silent) commitHistory();
+            const before = nodesRef.current;
+            const arranged = formatVisibleTree(before, collapsedRef.current);
+            applyNodes(arranged);
+            persistChangedPositions(before, arranged);
+            if (options.silent) baselineRef.current = arranged;
+            else scheduleHistoryCommit();
+        }));
     }
 
     async function runPendingTranslations(notebookId: string, mode: 'manual' | 'force') {
@@ -484,21 +834,20 @@ export default function MindmapPage() {
         setError(null);
         try {
             if (mode === 'force') {
-                await apiFetch(`${API_BASE}`, {
-                    method: 'POST', headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ resource: 'queue-force-retranslate', notebookId }),
-                });
+                await apiSend('POST', { resource: 'queue-force-retranslate', notebookId });
             }
             for (let batch = 0; batch < 20; batch += 1) {
-                const result = await apiFetch(`${API_BASE}`, {
-                    method: 'POST', headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ resource: 'translate-pending', notebookId, mode }),
-                }) as { translations: { id: string; texts: Partial<Record<Language, string>> }[]; pendingCount: number };
+                const result = await apiSend('POST', { resource: 'translate-pending', notebookId, mode }) as { translations: { id: string; texts: Partial<Record<Language, string>> }[]; pendingCount: number };
                 const view = activeViewRef.current;
                 if (view.notebookId === notebookId) {
                     const refreshed = await apiFetch(`${API_BASE}?resource=nodes&notebookId=${notebookId}&language=${view.language}`) as { nodes: MindNodeResponse[] };
                     if (activeViewRef.current.notebookId === notebookId && activeViewRef.current.language === view.language) {
-                        setNodes(refreshed.nodes.map(mapMindNode));
+                        // Chỉ merge phần hiển thị, không ghi đè vị trí/trạng thái cục bộ
+                        const fresh = new Map(refreshed.nodes.map((n) => [n.id, mapMindNode(n)]));
+                        applyNodes(nodesRef.current.map((n) => {
+                            const f = fresh.get(n.id);
+                            return f ? { ...n, text: f.text, translationPending: f.translationPending } : n;
+                        }));
                     }
                 }
                 if (result.pendingCount === 0 || result.translations.length === 0) break;
@@ -514,10 +863,7 @@ export default function MindmapPage() {
     async function changeNotebookLanguage(language: Language) {
         if (!activeNotebook || activeNotebook.language === language) return;
         try {
-            await apiFetch(`${API_BASE}`, {
-                method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ resource: 'notebook', id: activeNotebook.id, language }),
-            });
+            await apiSend('PATCH', { resource: 'notebook', id: activeNotebook.id, language });
             setNotebooks((previous) => previous.map((notebook) => notebook.id === activeNotebook.id ? { ...notebook, language } : notebook));
         } catch {
             setError('Could not change board language.');
@@ -528,10 +874,7 @@ export default function MindmapPage() {
         if (!descriptionEditor) return;
         const { notebookId, value } = descriptionEditor;
         try {
-            await apiFetch(`${API_BASE}`, {
-                method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ resource: 'notebook', id: notebookId, description: value }),
-            });
+            await apiSend('PATCH', { resource: 'notebook', id: notebookId, description: value });
             setNotebooks((previous) => previous.map((notebook) => notebook.id === notebookId ? { ...notebook, description: value.trim().slice(0, 2000) } : notebook));
             setDescriptionEditor(null);
         } catch {
@@ -539,31 +882,14 @@ export default function MindmapPage() {
         }
     }
 
-    function reflowComparedNodes() {
-        window.requestAnimationFrame(() => {
-            window.requestAnimationFrame(() => {
-                const arranged = formatVisibleTree(nodesRef.current, collapsedNodeIds);
-                const positions = new Map(arranged.map((node) => [node.id, { x: node.x, y: node.y }]));
-                setNodes((current) => current.map((node) => {
-                    const position = positions.get(node.id);
-                    return position ? { ...node, ...position } : node;
-                }));
-                persistPositions(arranged);
-            });
-        });
-    }
-
     async function translateNodeToLanguage(nodeId: string, language: Language) {
         setTranslatingNodeId(nodeId);
         setError(null);
         try {
-            const result = await apiFetch(`${API_BASE}`, {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ resource: 'translate-node', nodeId, targetLanguage: language, provider: translationProvider, model: translationModel }),
-            }) as NodeComparison;
+            const result = await apiSend('POST', { resource: 'translate-node', nodeId, targetLanguage: language, provider: translationProvider, model: translationModel }) as NodeComparison;
             setNodeComparisons((previous) => ({ ...previous, [nodeId]: result }));
             setContextMenu(null);
-            reflowComparedNodes();
+            relayoutAfterPaint({ silent: true });
         } catch (translationError) {
             setError(translationError instanceof Error ? translationError.message : 'Could not translate this node.');
         } finally {
@@ -579,7 +905,7 @@ export default function MindmapPage() {
                 return next;
             });
             setContextMenu(null);
-            reflowComparedNodes();
+            relayoutAfterPaint({ silent: true });
             return;
         }
 
@@ -587,7 +913,7 @@ export default function MindmapPage() {
             const result = await apiFetch(`${API_BASE}?resource=node-translation&nodeId=${encodeURIComponent(nodeId)}&language=${language}`) as { text: string };
             setNodeComparisons((previous) => ({ ...previous, [nodeId]: { language, text: result.text } }));
             setContextMenu(null);
-            reflowComparedNodes();
+            relayoutAfterPaint({ silent: true });
         } catch (translationError) {
             if (translationError instanceof Error && translationError.message === 'No current translation for this node and language.') {
                 await translateNodeToLanguage(nodeId, language);
@@ -611,25 +937,22 @@ export default function MindmapPage() {
         const parent = parentNode ?? list.find((n) => n.id === parentId);
         if (!parent) return 0;
 
-        const children = list.filter((n) => n.parentId === parentId).sort((a, b) => b.y - a.y);
-        if (children.length === 0) return parent.y + (parent.height || DEFAULT_H) + 16;
-
-        const bottomNode = children.reduce((latest, n) => {
-            const candidateBottom = n.y + (n.height || DEFAULT_H);
-            return candidateBottom > latest ? candidateBottom : latest;
-        }, parent.y + (parent.height || DEFAULT_H));
-
-        return bottomNode + 16;
+        const parentBottom = parent.y + (parent.height || DEFAULT_H);
+        const bottom = list.reduce(
+            (max, n) => n.parentId === parentId ? Math.max(max, n.y + (n.height || DEFAULT_H)) : max,
+            parentBottom,
+        );
+        return bottom + 16;
     }
 
     async function createNotebook(title: string, groupName = '') {
         const id = createStableId(), rootId = createStableId(), cleanTitle = title.trim() || 'Untitled notebook';
         try {
-            await apiFetch(`${API_BASE}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ resource: 'notebook', id, title: cleanTitle, rootId, groupName, language: activeLanguage }) });
+            await apiSend('POST', { resource: 'notebook', id, title: cleanTitle, rootId, groupName, language: activeLanguage });
             setNotebooks((prev) => [...prev, { id, title: cleanTitle, groupName, language: activeLanguage, description: '', sortOrder: prev.filter((item) => item.groupName === groupName).length }]);
             setActiveNotebookId(id);
-            const rootText = activeLanguage === 'ja' ? '中心となる考え' : activeLanguage === 'vi' ? 'Ý tưởng trung tâm' : 'Central idea';
-            setNodes([{ id: rootId, notebookId: id, parentId: null, text: rootText, x: 0, y: 0, type: 'text', width: DEFAULT_W, height: DEFAULT_H, autoWidth: true, imageUrl: null, preserveAspect: true, color: null, textAlign: 'center', translationPending: true }]);
+            const rootNode: MindNode = { id: rootId, notebookId: id, parentId: null, text: ROOT_TEXT[activeLanguage], sourceText: ROOT_TEXT[activeLanguage], sourceLanguage: activeLanguage, x: 0, y: 0, type: 'text', width: DEFAULT_W, height: DEFAULT_H, autoWidth: true, imageUrl: null, preserveAspect: true, color: null, textAlign: 'center', translationPending: true };
+            applyNodes([rootNode]); resetHistory([rootNode]);
             setPan(DEFAULT_PAN); setZoom(1);
         } catch {
             setError('Could not create this notebook.');
@@ -641,10 +964,7 @@ export default function MindmapPage() {
         if (!name || notebookGroups.some((group) => group.name.toLocaleLowerCase() === name.toLocaleLowerCase())) return;
         const group = { name, sortOrder: notebookGroups.length };
         try {
-            await apiFetch(`${API_BASE}`, {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ resource: 'group', name }),
-            });
+            await apiSend('POST', { resource: 'group', name });
             setNotebookGroups((prev) => [...prev, group]);
             setSelectedGroupName(name);
             setCollapsedNotebookGroups((previous) => new Set([...previous].filter((groupName) => groupName !== name)));
@@ -687,10 +1007,8 @@ export default function MindmapPage() {
 
     function saveNotebookArrangement(updated: Notebook[]) {
         setNotebooks(updated);
-        void apiFetch(`${API_BASE}`, {
-            method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ resource: 'notebook', action: 'reorder', notebooks: updated.map(({ id, sortOrder, groupName }) => ({ id, sortOrder, groupName })) }),
-        }).catch(() => setError('Could not save notebook order.'));
+        void apiSend('PATCH', { resource: 'notebook', action: 'reorder', notebooks: updated.map(({ id, sortOrder, groupName }) => ({ id, sortOrder, groupName })) })
+            .catch(() => setError('Could not save notebook order.'));
     }
 
     function moveNotebookTo(id: string, groupName: string, targetId: string | null, position: 'before' | 'after' | 'inside') {
@@ -702,8 +1020,8 @@ export default function MindmapPage() {
             ? sourceItems
             : notebooks.filter((item) => item.groupName === groupName).sort((a, b) => a.sortOrder - b.sortOrder);
         const sourceWithout = sourceItems.filter((item) => item.id !== id);
-        const targetIndex = targetId ? destinationItems.filter((item) => item.id !== id).findIndex((item) => item.id === targetId) : -1;
         const destinationWithout = destinationItems.filter((item) => item.id !== id);
+        const targetIndex = targetId ? destinationWithout.findIndex((item) => item.id === targetId) : -1;
         const insertAt = targetIndex < 0 ? destinationWithout.length : targetIndex + (position === 'after' ? 1 : 0);
         destinationWithout.splice(insertAt, 0, { ...source, groupName });
 
@@ -725,16 +1043,14 @@ export default function MindmapPage() {
         ordered.splice(targetIndex + (position === 'after' ? 1 : 0), 0, source);
         const updated = ordered.map((group, sortOrder) => ({ ...group, sortOrder }));
         setNotebookGroups(updated);
-        void apiFetch(`${API_BASE}`, {
-            method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ resource: 'group', action: 'reorder', groups: updated }),
-        }).catch(() => setError('Could not save group order.'));
+        void apiSend('PATCH', { resource: 'group', action: 'reorder', groups: updated })
+            .catch(() => setError('Could not save group order.'));
     }
 
     function renameNotebook(id: string, title: string) {
         const cleanTitle = title.trim() || 'Untitled notebook';
         setNotebooks((prev) => prev.map((n) => (n.id === id ? { ...n, title: cleanTitle } : n)));
-        apiFetch(`${API_BASE}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ resource: 'notebook', id, title: cleanTitle }) });
+        apiSend('PATCH', { resource: 'notebook', id, title: cleanTitle }).catch(() => setError('Could not rename this notebook.'));
     }
 
     async function deleteNotebook(id: string) {
@@ -756,11 +1072,7 @@ export default function MindmapPage() {
     async function restoreNotebook() {
         if (!recentlyDeletedNotebook) return;
         try {
-            await apiFetch(`${API_BASE}`, {
-                method: 'PATCH',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ resource: 'notebook', action: 'restore', id: recentlyDeletedNotebook.id }),
-            });
+            await apiSend('PATCH', { resource: 'notebook', action: 'restore', id: recentlyDeletedNotebook.id });
             setNotebooks((prev) => [...prev, recentlyDeletedNotebook]);
             setActiveNotebookId(recentlyDeletedNotebook.id);
             setRecentlyDeletedNotebook(null);
@@ -791,50 +1103,54 @@ export default function MindmapPage() {
 
         const newNode: MindNode = {
             id: newNodeId, notebookId: activeNotebookId, parentId, text,
+            sourceText: text, sourceLanguage: activeLanguage,
             x: initialX, y: initialY, type, width, height, autoWidth: true, imageUrl, preserveAspect: true, color: null, textAlign: 'center', translationPending: false,
         };
 
-        setNodes((prevNodes) => {
-            const latestNodes = [...prevNodes, newNode];
-            return autoFormat ? formatVisibleTree(latestNodes, nextCollapsedIds) : latestNodes;
-        });
+        const beforeNodes = currentNodes;
+        const afterNodes = autoFormat ? formatVisibleTree([...currentNodes, newNode], nextCollapsedIds) : [...currentNodes, newNode];
+        applyNodes(afterNodes);
+        scheduleHistoryCommit();
 
-        void apiFetch(`${API_BASE}`, {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ resource: 'node', ...newNode, imageUrl, preserveAspect: 1, language: activeLanguage })
-        }).then(() => {
-            if (autoFormat) {
-                window.requestAnimationFrame(() => {
-                    persistPositions(nodesRef.current.filter((node) => node.notebookId === activeNotebookId));
-                });
-            }
-        }).catch(() => setError('Could not save this node.'));
+        void queuedSend('POST', { resource: 'node', ...newNode, imageUrl, preserveAspect: 1, language: activeLanguage })
+            .catch(() => setError('Could not save this node.'));
+        if (autoFormat) persistChangedPositions(beforeNodes, afterNodes);
 
         setSelectedId(newNodeId);
         if (type === 'text') setEditingId(newNodeId);
     }
 
     function deleteNode(id: string) {
-        const toRemove = collectSubtreeIds(nodes, id);
-        setNodes(prev => {
-            const remaining = prev.filter((n) => !toRemove.has(n.id));
-            const laidOut = autoFormat ? formatVisibleTree(remaining, collapsedNodeIds) : remaining;
-            persistPositions(laidOut);
-            return laidOut;
-        });
+        if (!activeNotebookId) return;
+        const beforeNodes = nodesRef.current;
+        if (!beforeNodes.some((node) => node.id === id)) return;
+        const toRemove = collectSubtreeIds(beforeNodes, id);
+        const remaining = beforeNodes.filter((node) => !toRemove.has(node.id));
+        const laidOut = autoFormat ? formatVisibleTree(remaining, collapsedNodeIds) : remaining;
+        applyNodes(laidOut);
+        persistChangedPositions(remaining, laidOut);
         setCollapsedNodeIds((prev) => new Set([...prev].filter((nodeId) => !toRemove.has(nodeId))));
-        if (selectedId && toRemove.has(selectedId)) setSelectedId(null);
-        apiFetch(`${API_BASE}?resource=node&id=${id}`, { method: 'DELETE' });
+        setSelectedId((current) => current && toRemove.has(current) ? null : current);
+        scheduleHistoryCommit();
+        void queuedDelete(`${API_BASE}?resource=node&id=${encodeURIComponent(id)}`)
+            .catch(() => { setError('Could not delete this node.'); void reloadActiveBoard(); });
     }
 
-    async function updateNodeProps(id: string, updates: Partial<MindNode>, options: { throwOnError?: boolean } = {}) {
-        const currentNode = nodesRef.current.find((node) => node.id === id);
-        const textChanged = typeof updates.text === 'string' && updates.text !== currentNode?.text;
-        const savedUpdates = updates.text !== undefined && currentNode?.autoWidth
+    async function updateNodeProps(id: string, updates: Partial<MindNode>, options: { throwOnError?: boolean; force?: boolean } = {}) {
+        const beforeNodes = nodesRef.current;
+        const currentNode = beforeNodes.find((node) => node.id === id);
+        if (!currentNode) return;
+        const textChanged = typeof updates.text === 'string' && updates.text !== currentNode.text;
+        const savedUpdates: Partial<MindNode> = updates.text !== undefined && currentNode.autoWidth
             ? { ...updates, width: getAutoNodeWidth(updates.text) }
             : updates;
-        setNodes((previous) => previous.map((node) => node.id === id ? {
+        // Không có gì đổi (vd: onBlur gọi lại sau Enter) → không gọi API
+        const hasChange = (Object.keys(savedUpdates) as (keyof MindNode)[]).some((key) => savedUpdates[key] !== currentNode[key]);
+        if (!hasChange && !options.force) return;
+
+        applyNodes(beforeNodes.map((node) => node.id === id ? {
             ...node, ...savedUpdates,
+            ...(textChanged ? { sourceText: updates.text!, sourceLanguage: activeLanguage } : {}),
             translationPending: textChanged ? Boolean(updates.text?.trim()) : node.translationPending,
         } : node));
         if (textChanged) {
@@ -844,56 +1160,50 @@ export default function MindmapPage() {
                 return next;
             });
         }
+        scheduleHistoryCommit();
+        if ((savedUpdates.text !== undefined || savedUpdates.width !== undefined || savedUpdates.height !== undefined) && autoFormat) {
+            relayoutAfterPaint(); // chạy ngay, không đợi server trả lời
+        }
+
         const apiUpdates = { ...savedUpdates };
         if (!textChanged) delete apiUpdates.text;
         try {
-            await apiFetch(`${API_BASE}`, {
-                method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ resource: 'node', id, ...apiUpdates, ...(textChanged ? { language: activeLanguage } : {}) }),
-            });
+            await queuedSend('PATCH', { resource: 'node', id, ...apiUpdates, ...(textChanged ? { language: activeLanguage } : {}) });
         } catch (saveError) {
             setError('Could not save this node.');
             if (options.throwOnError) throw saveError;
         }
-        if ((savedUpdates.text !== undefined || savedUpdates.width !== undefined || savedUpdates.height !== undefined) && autoFormat) {
-            window.requestAnimationFrame(() => {
-                window.requestAnimationFrame(() => {
-                    const laidOut = formatVisibleTree(nodesRef.current, collapsedNodeIds);
-                    const positions = new Map(laidOut.map((node) => [node.id, { x: node.x, y: node.y }]));
-                    setNodes((current) => current.map((node) => {
-                        const position = positions.get(node.id);
-                        return position ? { ...node, ...position } : node;
-                    }));
-                    persistPositions(laidOut);
-                });
-            });
-        }
     }
 
     function rearrangeAll() {
-        const laidOut = formatVisibleTree(nodes, collapsedNodeIds);
-        setNodes(laidOut); persistPositions(laidOut);
+        const beforeNodes = nodesRef.current;
+        const laidOut = formatVisibleTree(beforeNodes, collapsedNodeIds);
+        applyNodes(laidOut);
+        persistChangedPositions(beforeNodes, laidOut);
+        scheduleHistoryCommit();
     }
 
     function formatVisibleTree(list: MindNode[], collapsedIds: Set<string>) {
-        const visible = getVisibleNodes(list, collapsedIds);
-        const positions = new Map(layoutTree(visible).map((node) => [node.id, { x: node.x, y: node.y }]));
-        return list.map((node) => {
-            const position = positions.get(node.id);
-            return position ? { ...node, ...position } : node;
-        });
+        return mergePositions(list, layoutTree(getVisibleNodes(list, collapsedIds)));
     }
 
+    // Collapse là trạng thái hiển thị: không vào history, phần layout được nhập vào baseline
     function toggleChildren(nodeId: string) {
         const nextCollapsedIds = new Set(collapsedNodeIds);
         if (nextCollapsedIds.has(nodeId)) nextCollapsedIds.delete(nodeId);
         else nextCollapsedIds.add(nodeId);
+
         setCollapsedNodeIds(nextCollapsedIds);
-        if (autoFormat) {
-            const laidOut = formatVisibleTree(nodes, nextCollapsedIds);
-            setNodes(laidOut);
-            persistPositions(laidOut);
-        }
+        if (!autoFormat) return;
+
+        window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
+            commitHistory();
+            const before = nodesRef.current;
+            const laidOut = formatVisibleTree(before, nextCollapsedIds);
+            applyNodes(laidOut);
+            baselineRef.current = laidOut;
+            persistChangedPositions(before, laidOut);
+        }));
     }
 
     function getDropTarget(clientX: number, clientY: number, draggedId: string) {
@@ -910,6 +1220,7 @@ export default function MindmapPage() {
     // Drag & Resize Handlers
     function handleNodePointerDown(e: ReactPointerEvent, node: MindNode) {
         e.stopPropagation(); (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+        commitHistory(); // chốt thay đổi đang chờ để ranh giới entry rõ ràng
         dragRef.current = { type: 'move', id: node.id, startX: 0, startY: 0, startW: 0, startH: 0 };
         setSelectedId(node.id);
     }
@@ -917,6 +1228,7 @@ export default function MindmapPage() {
     function handleResizePointerDown(e: ReactPointerEvent, node: MindNode) {
         e.stopPropagation();
         (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+        commitHistory();
         const el = document.getElementById(`node-media-${node.id}`) ?? document.getElementById(`node-${node.id}`);
         dragRef.current = { type: 'resize', id: node.id, startX: e.clientX, startY: e.clientY, startW: el ? el.offsetWidth : node.width, startH: el ? el.offsetHeight : node.height };
         setSelectedId(node.id);
@@ -925,21 +1237,17 @@ export default function MindmapPage() {
     function handlePointerMove(e: ReactPointerEvent) {
         const { type, id, startX, startY, startW, startH } = dragRef.current;
         if (!id) return;
+        const current = nodesRef.current;
 
         if (type === 'move') {
-            setDropTargetId(getDropTarget(e.clientX, e.clientY, id));
+            const nextDropTarget = getDropTarget(e.clientX, e.clientY, id);
+            setDropTargetId((prev) => prev === nextDropTarget ? prev : nextDropTarget);
             const dx = e.movementX / zoom;
             const dy = e.movementY / zoom;
-            setNodes(prev => {
-                if (!autoFormat) {
-                    return prev.map(n => n.id === id ? { ...n, x: n.x + dx, y: n.y + dy } : n);
-                }
-
-                const subtreeIds = collectSubtreeIds(prev, id);
-                return prev.map(n => subtreeIds.has(n.id) ? { ...n, x: n.x + dx, y: n.y + dy } : n);
-            });
+            const movedIds = autoFormat ? collectSubtreeIds(current, id) : new Set([id]);
+            applyNodes(current.map((n) => movedIds.has(n.id) ? { ...n, x: n.x + dx, y: n.y + dy } : n));
         } else if (type === 'resize') {
-            const node = nodesRef.current.find(n => n.id === id);
+            const node = current.find(n => n.id === id);
             if (!node) return;
             let newW = Math.max(80, startW + (e.clientX - startX) / zoom);
             let newH = Math.max(40, startH + (e.clientY - startY) / zoom);
@@ -949,44 +1257,36 @@ export default function MindmapPage() {
                 if (Math.abs(e.clientX - startX) > Math.abs(e.clientY - startY)) newH = newW / ratio;
                 else newW = newH * ratio;
             }
-            setNodes(prev => prev.map(n => n.id === id ? { ...n, width: newW, height: newH } : n));
+            applyNodes(current.map((n) => n.id === id ? { ...n, width: newW, height: newH } : n));
         }
     }
 
     function handlePointerUp(e: ReactPointerEvent<HTMLDivElement>) {
         const { id, type, startX, startY } = dragRef.current;
-        if (id) {
-            const targetId = type === 'move' ? getDropTarget(e.clientX, e.clientY, id) : null;
-            const liveNodes = nodesRef.current;
-            const liveNode = liveNodes.find(n => n.id === id);
-            if (!liveNode) {
-                dragRef.current.id = null;
-                return;
-            }
-
+        const liveNode = id ? nodesRef.current.find((n) => n.id === id) : undefined;
+        if (id && liveNode) {
             if (type === 'resize') {
-                const wasResized = e.clientX !== startX || e.clientY !== startY;
-                updateNodeProps(id, {
-                    width: liveNode.width,
-                    height: liveNode.height,
-                    ...(wasResized && liveNode.type === 'text' ? { autoWidth: false } : {}),
-                });
-            } else {
+                if (e.clientX !== startX || e.clientY !== startY) {
+                    void updateNodeProps(id, {
+                        width: liveNode.width, height: liveNode.height,
+                        ...(liveNode.type === 'text' ? { autoWidth: false } : {}),
+                    }, { force: true });
+                }
+            } else if (type === 'move') {
+                const targetId = getDropTarget(e.clientX, e.clientY, id);
                 const parentChanged = Boolean(targetId && targetId !== liveNode.parentId);
+                const liveNodes = nodesRef.current;
                 const reparented = parentChanged
                     ? liveNodes.map((node) => node.id === id ? { ...node, parentId: targetId! } : node)
                     : liveNodes;
                 const nextNodes = autoFormat ? formatVisibleTree(reparented, collapsedNodeIds) : reparented;
-                setNodes(nextNodes);
+                applyNodes(nextNodes);
                 if (parentChanged) {
-                    const movedNode = nextNodes.find((node) => node.id === id)!;
-                    void apiFetch(`${API_BASE}`, {
-                        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ resource: 'node', id, parentId: targetId, x: movedNode.x, y: movedNode.y }),
-                    }).catch(() => setError('Could not change this node parent.'));
+                    void queuedSend('PATCH', { resource: 'node', id, parentId: targetId })
+                        .catch(() => setError('Could not change this node parent.'));
                 }
-                const movedIds = autoFormat ? new Set(nextNodes.map((node) => node.id)) : parentChanged ? new Set([id]) : collectSubtreeIds(nextNodes, id);
-                persistPositions(nextNodes.filter((node) => movedIds.has(node.id)));
+                persistChangedPositions(baselineRef.current, nextNodes); // chỉ node thực sự đổi vị trí
+                scheduleHistoryCommit();                                  // click không kéo → diff rỗng → không có entry
             }
         }
         dragRef.current.id = null;
@@ -1111,7 +1411,7 @@ export default function MindmapPage() {
 
     function resetView() { centerRoot(1); }
 
-    const groupedNotebooks = [
+    const groupedNotebooks = useMemo(() => [
         ...[...notebookGroups].sort((a, b) => a.sortOrder - b.sortOrder).map(({ name: groupName }) => ({
             groupName,
             notebooks: notebooks.filter((notebook) => notebook.groupName === groupName).sort((a, b) => a.sortOrder - b.sortOrder),
@@ -1120,9 +1420,10 @@ export default function MindmapPage() {
             groupName: '',
             notebooks: notebooks.filter((notebook) => !notebook.groupName).sort((a, b) => a.sortOrder - b.sortOrder),
         },
-    ];
+    ], [notebookGroups, notebooks]);
     const pendingTranslationCount = nodes.filter((node) => node.translationPending).length;
     const forceTranslationCount = nodes.filter((node) => node.text.trim()).length;
+    const contextNode = contextMenu ? nodes.find((node) => node.id === contextMenu.nodeId) : undefined;
 
     return (
         <div className={`${manrope.variable} ${inter.variable} flex h-full min-h-0 w-full min-w-0 overflow-hidden bg-[#FAFAFC]`} style={{ fontFamily: 'var(--font-ui)' }}>
@@ -1131,7 +1432,6 @@ export default function MindmapPage() {
                 <aside className="w-64 flex h-full flex-col border-r border-[#E4E4ED] bg-white">
                     <div className="flex items-center justify-between border-b border-[#EEEDF6] px-3 py-3">
                         <div className="flex items-center gap-2">
-                            {/* <FolderIcon /> */}
                             <span className="text-sm font-bold tracking-tight text-[#201F2E]" style={{ fontFamily: 'var(--font-display)' }}>Notebooks</span>
                         </div>
                         <div className="flex items-center gap-1">
@@ -1296,8 +1596,13 @@ export default function MindmapPage() {
                     backgroundSize: `${40 * zoom}px ${40 * zoom}px`,
                     backgroundPosition: `${pan.x}px ${pan.y}px`,
                     touchAction: viewMode === 'map' ? 'none' : 'auto',
-                    overflow: viewMode === 'map' ? 'hidden' : 'auto',
+                    overflow: viewMode === 'map' ? 'clip' : 'auto',
                     overscrollBehavior: 'none',
+                }}
+                onScroll={(e) => {
+                    if (viewMode !== 'map') return;
+                    const el = e.currentTarget;
+                    if (el.scrollLeft || el.scrollTop) el.scrollTo(0, 0);
                 }}
                 onContextMenu={(e) => { if (viewMode === 'map') e.preventDefault(); }}
                 onPointerDown={(e: ReactPointerEvent<HTMLDivElement>) => { setBoardActive(true); handleCanvasPointerDown(e); handleBackgroundPointerDown(e); }}
@@ -1378,16 +1683,14 @@ export default function MindmapPage() {
                         onChange={(event) => { void changeNotebookLanguage(event.target.value as Language); }}
                         className="h-10 flex-shrink-0 rounded-xl border border-[#E4E4ED] bg-white px-3 text-sm font-semibold text-[#4B4A5C] shadow-sm outline-none focus:border-[#7B61FF] disabled:opacity-40"
                     >
-                        <option value="vi">Tiếng Việt</option>
-                        <option value="ja">日本語</option>
-                        <option value="en">English</option>
+                        {LANGUAGES.map((language) => <option key={language} value={language}>{LANGUAGE_LABELS[language]}</option>)}
                     </select>
                     {/* Keep batch actions for future use; hide them while per-node translation is preferred. */}
                     <button
                         onClick={() => { if (activeNotebookId) void runPendingTranslations(activeNotebookId, 'manual'); }}
                         disabled={!activeNotebookId || pendingTranslationCount === 0 || isTranslating}
                         title="Translate missing languages for nodes without current translations"
-                        className="hidden flex h-10 flex-shrink-0 items-center justify-center gap-1.5 rounded-xl border border-[#E4E4ED] bg-white px-3 text-sm font-semibold text-[#4B4A5C] shadow-sm hover:bg-[#F2F1FA] disabled:cursor-not-allowed disabled:opacity-40"
+                        className=" flex h-10 flex-shrink-0 items-center justify-center gap-1.5 rounded-xl border border-[#E4E4ED] bg-white px-3 text-sm font-semibold text-[#4B4A5C] shadow-sm hover:bg-[#F2F1FA] disabled:cursor-not-allowed disabled:opacity-40"
                     >
                         <SparkleIcon /> {isTranslating ? 'Translating…' : `Translate missing (${pendingTranslationCount})`}
                     </button>
@@ -1403,6 +1706,24 @@ export default function MindmapPage() {
                     >
                         <SparkleIcon /> Force retranslate ({forceTranslationCount})
                     </button>
+                    {viewMode === 'map' && <div className="flex h-10 flex-shrink-0 items-center gap-1 rounded-xl border border-[#E4E4ED] bg-white px-1 shadow-sm">
+                        <button
+                            type="button"
+                            onClick={() => historyActionsRef.current.undo()}
+                            disabled={!historyFlags.undo}
+                            title={historyFlags.undo ? `Undo ${historyFlags.undo} (Ctrl+Z)` : 'Nothing to undo'}
+                            aria-label="Undo"
+                            className="rounded-lg px-2 py-1 text-xs font-semibold text-[#4B4A5C] hover:bg-[#F2F1FA] disabled:cursor-not-allowed disabled:opacity-40"
+                        >Undo</button>
+                        <button
+                            type="button"
+                            onClick={() => historyActionsRef.current.redo()}
+                            disabled={!historyFlags.redo}
+                            title={historyFlags.redo ? `Redo ${historyFlags.redo} (Ctrl+Y)` : 'Nothing to redo'}
+                            aria-label="Redo"
+                            className="rounded-lg px-2 py-1 text-xs font-semibold text-[#4B4A5C] hover:bg-[#F2F1FA] disabled:cursor-not-allowed disabled:opacity-40"
+                        >Redo</button>
+                    </div>}
                     {viewMode === 'map' && <label className="flex items-center gap-2 rounded-xl border border-[#E4E4ED] bg-white px-3 py-2 text-xs font-semibold text-[#4B4A5C] shadow-sm">
                         <span>Auto format</span>
                         <button
@@ -1449,7 +1770,7 @@ export default function MindmapPage() {
                     {visibleNodes.map((node) => {
                         const isRoot = node.parentId === null;
                         const isSelected = selectedId === node.id;
-                        const childCount = nodes.filter((child) => child.parentId === node.id).length;
+                        const childCount = childCounts.get(node.id) ?? 0;
                         const comparison = nodeComparisons[node.id];
                         return (
                             <div
@@ -1474,7 +1795,7 @@ export default function MindmapPage() {
                                     e.preventDefault();
                                     e.stopPropagation();
                                     setSelectedId(node.id);
-                                    setTranslationTargetLanguage((['vi', 'ja', 'en'] as const).find((language) => language !== activeLanguage) ?? 'vi');
+                                    setTranslationTargetLanguage(otherLanguages(activeLanguage)[0]);
                                     setContextMenu({ x: e.clientX, y: e.clientY, nodeId: node.id });
                                 }}
                             >
@@ -1496,7 +1817,7 @@ export default function MindmapPage() {
                                                         const width = !node.autoWidth
                                                             ? node.width || DEFAULT_W
                                                             : getAutoNodeWidth(text);
-                                                        setNodes((previous) => previous.map((item) => item.id === node.id ? { ...item, width } : item));
+                                                        applyNodes(nodesRef.current.map((item) => item.id === node.id ? { ...item, width } : item));
                                                     }}
                                                     onKeyDown={(e) => {
                                                         if (e.key === 'Enter' && !e.shiftKey) {
@@ -1527,7 +1848,7 @@ export default function MindmapPage() {
                                         </div>
                                         {comparison && (
                                             <div className="flex w-1/2 min-w-0 flex-col justify-center px-3 py-3" lang={comparison.language}>
-                                                <span className="mb-1 text-[10px] font-bold uppercase text-[#777687]">{comparison.language === 'en' ? 'English' : comparison.language === 'ja' ? '日本語' : 'Tiếng Việt'}</span>
+                                                <span className="mb-1 text-[10px] font-bold uppercase text-[#777687]">{LANGUAGE_LABELS[comparison.language]}</span>
                                                 <p className="whitespace-pre-wrap break-words text-[15px] font-semibold leading-snug text-[#201F2E]" style={{ fontFamily: 'var(--font-display)' }}>{comparison.text}</p>
                                             </div>
                                         )}
@@ -1561,6 +1882,12 @@ export default function MindmapPage() {
                 </div>
             )}
 
+            {historyToast && (
+                <div role="status" className="pointer-events-none fixed bottom-20 left-1/2 z-40 -translate-x-1/2 rounded-xl bg-[#2B2A3D] px-4 py-2 text-sm font-semibold text-white shadow-xl">
+                    {historyToast}
+                </div>
+            )}
+
             {contextMenu && (
                 <div ref={contextMenuRef} style={{ position: 'fixed', left: contextMenu.x, top: contextMenu.y }} className="z-50 max-h-[calc(100vh-1rem)] w-56 overflow-y-auto rounded-xl border border-[#E4E4ED] bg-white py-1.5 shadow-xl text-black">
                     <div className="border-y border-[#EEEDF6] px-3 py-2.5">
@@ -1571,8 +1898,8 @@ export default function MindmapPage() {
                             onChange={(event) => setTranslationTargetLanguage(event.target.value as Language)}
                             className="mb-2 h-8 w-full rounded-md border border-[#DEDCEB] bg-white px-2 text-sm text-[#333244] outline-none focus:border-[#7B61FF]"
                         >
-                            {(['vi', 'ja', 'en'] as const).filter((language) => language !== activeLanguage).map((language) => (
-                                <option key={language} value={language}>{language === 'en' ? 'English' : language === 'ja' ? '日本語' : 'Tiếng Việt'}</option>
+                            {otherLanguages(activeLanguage).map((language) => (
+                                <option key={language} value={language}>{LANGUAGE_LABELS[language]}</option>
                             ))}
                         </select>
                         <button
@@ -1589,7 +1916,7 @@ export default function MindmapPage() {
                         </button>
                         <button
                             type="button"
-                            disabled={translatingNodeId === contextMenu.nodeId || !nodes.find((node) => node.id === contextMenu.nodeId)?.text.trim()}
+                            disabled={translatingNodeId === contextMenu.nodeId || !contextNode?.text.trim()}
                             onClick={() => void translateNodeToLanguage(contextMenu.nodeId, translationTargetLanguage)}
                             className="flex h-8 w-full items-center justify-center rounded-md px-2 text-xs font-semibold text-[#626174] hover:bg-[#F2F1FA] disabled:cursor-not-allowed disabled:opacity-50"
                         >
@@ -1603,27 +1930,24 @@ export default function MindmapPage() {
                     <div className="px-3 py-2">
                         <p className="mb-1.5 text-xs font-medium text-[#777687]">Text alignment</p>
                         <div className="flex gap-1">
-                            {(['left', 'center', 'right'] as const).map((alignment) => {
-                                const node = nodes.find((item) => item.id === contextMenu.nodeId);
-                                return (
-                                    <button
-                                        key={alignment}
-                                        type="button"
-                                        aria-label={`Align text ${alignment}`}
-                                        title={`Align ${alignment}`}
-                                        onClick={() => { updateNodeProps(contextMenu.nodeId, { textAlign: alignment }); setContextMenu(null); }}
-                                        className={`flex h-8 flex-1 items-center justify-center rounded-md ${node?.textAlign === alignment ? 'bg-[#EFECFF] text-[#4B33E0]' : 'text-[#626174] hover:bg-[#F2F1FA]'}`}
-                                    >
-                                        <AlignIcon alignment={alignment} />
-                                    </button>
-                                );
-                            })}
+                            {(['left', 'center', 'right'] as const).map((alignment) => (
+                                <button
+                                    key={alignment}
+                                    type="button"
+                                    aria-label={`Align text ${alignment}`}
+                                    title={`Align ${alignment}`}
+                                    onClick={() => { updateNodeProps(contextMenu.nodeId, { textAlign: alignment }); setContextMenu(null); }}
+                                    className={`flex h-8 flex-1 items-center justify-center rounded-md ${contextNode?.textAlign === alignment ? 'bg-[#EFECFF] text-[#4B33E0]' : 'text-[#626174] hover:bg-[#F2F1FA]'}`}
+                                >
+                                    <AlignIcon alignment={alignment} />
+                                </button>
+                            ))}
                         </div>
                     </div>
 
-                    {nodes.find(n => n.id === contextMenu.nodeId)?.type === 'image' && (
-                        <button className="flex w-full items-center justify-between px-3 py-2 text-left text-sm text-[#333244] hover:bg-[#F2F1FA] transition-colors" onClick={() => { const node = nodes.find(n => n.id === contextMenu.nodeId)!; updateNodeProps(node.id, { preserveAspect: !node.preserveAspect }); }}>
-                            Preserve Aspect Ratio <span>{nodes.find(n => n.id === contextMenu.nodeId)?.preserveAspect ? '✅' : '❌'}</span>
+                    {contextNode?.type === 'image' && (
+                        <button className="flex w-full items-center justify-between px-3 py-2 text-left text-sm text-[#333244] hover:bg-[#F2F1FA] transition-colors" onClick={() => updateNodeProps(contextNode.id, { preserveAspect: !contextNode.preserveAspect })}>
+                            Preserve Aspect Ratio <span>{contextNode.preserveAspect ? '✅' : '❌'}</span>
                         </button>
                     )}
 
