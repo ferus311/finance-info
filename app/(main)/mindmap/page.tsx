@@ -150,6 +150,30 @@ const MAX_AUTO_NODE_W = 400;
 const LEVEL_GAP_X = 64, SIBLING_GAP = 28, TREE_GAP = 64;
 const MIN_ZOOM = 0.05, MAX_ZOOM = 3, DEFAULT_PAN = { x: 160, y: 180 };
 const NODE_COLORS = ['#FFFFFF', '#FFEFE5', '#E5F4FF', '#EAFCE9', '#F4E5FF', '#FFF0F0'];
+const COLLAPSED_GROUPS_KEY = 'mindmap-collapsed-groups';
+const MINDMAP_SIDEBAR_OPEN_KEY = 'mindmap-sidebar-open';
+
+function readStoredStringSet(key: string): Set<string> {
+    try {
+        const stored = window.localStorage.getItem(key);
+        if (stored === null) return new Set();
+        const parsed: unknown = JSON.parse(stored);
+        return Array.isArray(parsed)
+            ? new Set(parsed.filter((value): value is string => typeof value === 'string'))
+            : new Set();
+    } catch (error) {
+        console.error(`Could not load ${key}.`, error);
+        return new Set();
+    }
+}
+
+function writeStoredStringSet(key: string, values: Set<string>) {
+    try {
+        window.localStorage.setItem(key, JSON.stringify([...values]));
+    } catch (error) {
+        console.error(`Could not save ${key}.`, error);
+    }
+}
 
 // Canvas context được tạo một lần và tái sử dụng thay vì tạo mới mỗi lần đo chữ.
 let measureContext: CanvasRenderingContext2D | null | undefined;
@@ -297,8 +321,10 @@ export default function MindmapPage() {
     const [notebooks, setNotebooks] = useState<Notebook[]>([]);
     const [notebookGroups, setNotebookGroups] = useState<NotebookGroup[]>([]);
     const [collapsedNotebookGroups, setCollapsedNotebookGroups] = useState<Set<string>>(new Set());
+    const [mindmapPreferencesLoaded, setMindmapPreferencesLoaded] = useState(false);
     const [selectedGroupName, setSelectedGroupName] = useState<string | null>(null);
     const [activeNotebookId, setActiveNotebookId] = useState<string | null>(null);
+    const [loadedNodesNotebookId, setLoadedNodesNotebookId] = useState<string | null>(null);
     const [loadingNotebooks, setLoadingNotebooks] = useState(true);
     const [loadingNodes, setLoadingNodes] = useState(false);
     const [isCreatingNotebook, setIsCreatingNotebook] = useState(false);
@@ -332,6 +358,7 @@ export default function MindmapPage() {
     const [isDocumentSaving, setIsDocumentSaving] = useState(false);
     const [boardActive, setBoardActive] = useState(false);
     const [collapsedNodeIds, setCollapsedNodeIds] = useState<Set<string>>(new Set());
+    const [collapsedStateNotebookId, setCollapsedStateNotebookId] = useState<string | null>(null);
     const [dropTargetId, setDropTargetId] = useState<string | null>(null);
 
     const containerRef = useRef<HTMLDivElement>(null);
@@ -364,14 +391,32 @@ export default function MindmapPage() {
     const handleDocumentSavingChange = useCallback((saving: boolean) => setIsDocumentSaving(saving), []);
 
     useEffect(() => {
-        try {
-            const savedGroups = JSON.parse(window.localStorage.getItem('mindmap-collapsed-groups') || '[]');
-            if (Array.isArray(savedGroups)) {
-                const groupNames = savedGroups.filter((name): name is string => typeof name === 'string');
-                queueMicrotask(() => setCollapsedNotebookGroups(new Set(groupNames)));
+        queueMicrotask(() => {
+            try {
+                const savedSidebarOpen = window.localStorage.getItem(MINDMAP_SIDEBAR_OPEN_KEY);
+                if (savedSidebarOpen === 'true' || savedSidebarOpen === 'false') setIsSidebarOpen(savedSidebarOpen === 'true');
+            } catch (error) {
+                console.error('Could not load the mindmap sidebar preference.', error);
             }
-        } catch { }
+            setCollapsedNotebookGroups(readStoredStringSet(COLLAPSED_GROUPS_KEY));
+            setMindmapPreferencesLoaded(true);
+        });
     }, []);
+
+    useEffect(() => {
+        if (!mindmapPreferencesLoaded) return;
+        try {
+            window.localStorage.setItem(MINDMAP_SIDEBAR_OPEN_KEY, String(isSidebarOpen));
+        } catch (error) {
+            console.error('Could not save the mindmap sidebar preference.', error);
+        }
+        writeStoredStringSet(COLLAPSED_GROUPS_KEY, collapsedNotebookGroups);
+    }, [collapsedNotebookGroups, isSidebarOpen, mindmapPreferencesLoaded]);
+
+    useEffect(() => {
+        if (!activeNotebookId || collapsedStateNotebookId !== activeNotebookId) return;
+        writeStoredStringSet(`mindmap-collapsed-nodes:${activeNotebookId}`, collapsedNodeIds);
+    }, [activeNotebookId, collapsedNodeIds, collapsedStateNotebookId]);
 
     useEffect(() => {
         if (!recentlyDeletedNotebook) return;
@@ -510,7 +555,13 @@ export default function MindmapPage() {
 
     useEffect(() => {
         if (!activeNotebookId) {
-            queueMicrotask(() => { applyNodes([]); resetHistory([]); });
+            queueMicrotask(() => {
+                applyNodes([]);
+                resetHistory([]);
+                setCollapsedNodeIds(new Set());
+                setCollapsedStateNotebookId(null);
+                setLoadedNodesNotebookId(null);
+            });
             return;
         }
         let cancelled = false;
@@ -520,6 +571,11 @@ export default function MindmapPage() {
                 const data = await apiFetch(`${API_BASE}?resource=nodes&notebookId=${activeNotebookId}&language=${activeLanguage}`) as { nodes: MindNodeResponse[] };
                 if (cancelled) return;
                 const mapped = data.nodes.map(mapMindNode);
+                const parentsWithChildren = new Set(mapped.flatMap((node) => node.parentId ? [node.parentId] : []));
+                const savedCollapsedIds = readStoredStringSet(`mindmap-collapsed-nodes:${activeNotebookId}`);
+                setCollapsedNodeIds(new Set([...savedCollapsedIds].filter((id) => parentsWithChildren.has(id))));
+                setCollapsedStateNotebookId(activeNotebookId);
+                setLoadedNodesNotebookId(activeNotebookId);
                 applyNodes(mapped); resetHistory(mapped); setPan(DEFAULT_PAN); setZoom(1);
             } catch { if (!cancelled) setError('Could not load this board.'); } finally { if (!cancelled) setLoadingNodes(false); }
         })();
@@ -978,7 +1034,6 @@ export default function MindmapPage() {
             const next = new Set(previous);
             if (next.has(name)) next.delete(name);
             else next.add(name);
-            window.localStorage.setItem('mindmap-collapsed-groups', JSON.stringify([...next]));
             return next;
         });
     }
@@ -995,7 +1050,6 @@ export default function MindmapPage() {
             setCollapsedNotebookGroups((previous) => {
                 const next = new Set(previous);
                 next.delete(name);
-                window.localStorage.setItem('mindmap-collapsed-groups', JSON.stringify([...next]));
                 return next;
             });
             setSelectedGroupName((previous) => previous === name ? null : previous);
@@ -1757,7 +1811,7 @@ export default function MindmapPage() {
                         key={activeNotebook?.id ?? 'empty'}
                         notebook={activeNotebook}
                         nodes={nodes}
-                        loading={loadingNodes}
+                        loading={loadingNodes || (activeNotebookId !== null && loadedNodesNotebookId !== activeNotebookId)}
                         onEditingChange={handleDocumentEditingChange}
                         onSavingChange={handleDocumentSavingChange}
                         onSaveNodeText={(id, text) => updateNodeProps(id, { text }, { throwOnError: true })}

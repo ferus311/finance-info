@@ -1,90 +1,76 @@
 import { NextResponse } from "next/server";
-import { YoutubeTranscript } from "youtube-transcript-plus";
 import kuromoji from "kuromoji";
 import path from "node:path";
 import fs from "node:fs";
+import fsp from "node:fs/promises";
+import os from "node:os";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
 
 // Prevent Next.js from caching this API route
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
-type RawCaption = { text: string; offset: number; duration: number; actualEnd?: number };
+// ==========================================
+// DATA TYPES (100% tương thích với UI hiện tại)
+// ==========================================
 type Block = { id: string; text: string; start: number; end: number };
 type Token = kuromoji.IpadicFeatures;
+type WordToken = { word: string; start: number; end: number };
 
 const DEFAULT_MIN_BLOCK_SEC = 7;
 const DEFAULT_MAX_BLOCK_SEC = 20;
 
 // ==========================================
-// LANGUAGE CONFIG
-// Segmentation behaves differently depending on whether the language is
-// written without spaces between words (Japanese, Chinese) or with spaces
-// (English, Vietnamese, Korean, French, ...). Everything below is driven
-// by this config instead of hardcoded Japanese punctuation/logic.
+// LANGUAGE CONFIG (Tối giản hóa cho Word-Level)
 // ==========================================
 type LangConfig = {
-    strongEnders: string; // characters that end a sentence outright (e.g. "。！？" or ".!?")
-    softEnders: string; // strongEnders plus "soft" pause characters (e.g. "、" or ",")
-    useTokenizer: boolean; // whether the Kuromoji (Japanese-only) morphological analyzer applies
-    joinWithSpace: boolean; // whether captions should be joined with a space (word-based langs) or concatenated directly (char-based langs)
-    trailingSpan: number; // how many trailing units (chars or ~chars of a few words) can be carried over to the next block
-    leadingSpan: number; // how many leading units can be borrowed from the next caption
+    strongEnders: string[];
+    softEnders: string[];
+    dependentMarks: string[]; // Các dấu câu không bao giờ được phép đứng đầu câu mới
+    useTokenizer: boolean;
+    joinWithSpace: boolean;
+    silenceThreshold: number; // Ngưỡng khoảng lặng (giây) để nhận diện ngắt nghỉ tự nhiên
 };
 
 const LANG_CONFIGS: Record<string, LangConfig> = {
-    ja: { strongEnders: "。！？", softEnders: "。！？、", useTokenizer: true, joinWithSpace: false, trailingSpan: 3, leadingSpan: 3 },
-    zh: { strongEnders: "。！？", softEnders: "。！？，", useTokenizer: false, joinWithSpace: false, trailingSpan: 3, leadingSpan: 3 },
+    ja: {
+        strongEnders: ["。", "！", "？", ".", "!", "?"],
+        softEnders: ["、", "，", ",", "；", ";"],
+        dependentMarks: ["。", "、", "！", "？", ".", ",", "!", "?", "」", "』", ")", "）", "】", "…"],
+        useTokenizer: true,
+        joinWithSpace: false,
+        silenceThreshold: 0.8,
+    },
+    zh: {
+        strongEnders: ["。", "！", "？", ".", "!", "?"],
+        softEnders: ["，", "、", ",", "；", ";"],
+        dependentMarks: ["。", "，", "、", "！", "？", ".", ",", "!", "?", "”", "’", ")", "）", "】"],
+        useTokenizer: false,
+        joinWithSpace: false,
+        silenceThreshold: 0.8,
+    },
 };
 
-// Reasonable default for any language not explicitly listed above: assumes
-// space-separated words and Latin-style punctuation (covers en, vi, ko, fr, es, de, pt, etc.)
 const DEFAULT_LANG_CONFIG: LangConfig = {
-    strongEnders: ".!?",
-    softEnders: ".!?,;",
+    strongEnders: [".", "!", "?"],
+    softEnders: [",", ";", ":"],
+    dependentMarks: [".", ",", "!", "?", ";", ":", ")", "]", "}", '"', "'"],
     useTokenizer: false,
     joinWithSpace: true,
-    trailingSpan: 20,
-    leadingSpan: 20,
+    silenceThreshold: 1.0,
 };
 
 function getLangConfig(lang: string): LangConfig {
     return LANG_CONFIGS[lang] ?? DEFAULT_LANG_CONFIG;
 }
 
-function escapeRegexChars(chars: string) {
-    return chars.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 // ==========================================
-// HELPERS: timing estimation
+// Kuromoji tokenizer (Lazy load cho Tiếng Nhật)
 // ==========================================
-function unitLength(text: string, config: LangConfig) {
-    return config.joinWithSpace ? text.trim().split(/\s+/).filter(Boolean).length : text.length;
-}
-
-// Estimates how much time a snippet of text takes to speak, used to shift
-// timestamps when text is borrowed/carried between blocks.
-function calculateShiftTime(unitCount: number, joinWithSpace: boolean, maxCap: number = 1.5) {
-    const baseTime = 0.2; // breathing/pause allowance
-    const timePerUnit = joinWithSpace ? 0.3 : 0.35; // ~0.3s per word, ~0.35s per character
-    return Math.min(maxCap, baseTime + unitCount * timePerUnit);
-}
-
-function appendText(base: string, addition: string, joinWithSpace: boolean) {
-    if (!base) return addition;
-    if (!addition) return base;
-    return joinWithSpace ? `${base} ${addition}` : base + addition;
-}
-
-function cleanText(text: string, joinWithSpace: boolean) {
-    const collapsed = text.replace(/\s+/g, " ").trim();
-    return joinWithSpace ? collapsed : collapsed.replace(/\s+/g, "");
-}
-
-// ==========================================
-// Kuromoji tokenizer (Japanese only) — loaded lazily and only when needed
-// ==========================================
-let tokenizerPromise: Promise<kuromoji.Tokenizer<Token>> | null = null;
+let tokenizerPromise: Promise<kuromoji.Tokenizer<Token> | null> | null = null;
 function getTokenizer() {
     if (!tokenizerPromise) {
         tokenizerPromise = new Promise((resolve) => {
@@ -94,8 +80,8 @@ function getTokenizer() {
             }
             kuromoji.builder({ dicPath }).build((err, tokenizer) => {
                 if (err) {
-                    console.warn("Kuromoji failed to load. Falling back to length-based cuts.", err);
-                    resolve(null as any);
+                    console.warn("Kuromoji failed to load. Falling back to timing-based cuts.", err);
+                    resolve(null);
                 } else resolve(tokenizer);
             });
         });
@@ -108,6 +94,134 @@ function parseDurationParam(value: string | null, fallback: number) {
     return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function getYtDlpPath(): string {
+    const candidates = [
+        "/home/fong/.local/bin/yt-dlp", // 🎯 Đường dẫn thực tế vừa cài đặt qua pip
+        "/home/fong/project_ai/python-app/.venv/bin/yt-dlp", // Đường dẫn trong .venv hôm nọ
+        "/usr/local/bin/yt-dlp",
+        "/usr/bin/yt-dlp",
+    ];
+    for (const p of candidates) {
+        if (fs.existsSync(p)) return p;
+    }
+    return "yt-dlp"; // Fallback cuối cùng nếu không thấy
+}
+
+
+// ==========================================
+// CORE ENGINE 1: Tải và Bóc tách json3 bằng yt-dlp
+// ==========================================
+async function fetchJson3WithYtDlp(videoId: string, lang: string): Promise<any> {
+    // Validate videoId để chống lỗi Command Injection tuyệt đối
+    if (!/^[a-zA-Z0-9_-]{6,20}$/.test(videoId)) {
+        throw new Error("Invalid YouTube videoId format.");
+    }
+
+    const tempDir = os.tmpdir();
+    const uniquePrefix = `yt_sub_${videoId}_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+    const outTemplate = path.join(tempDir, `${uniquePrefix}.%(ext)s`);
+    const url = `https://www.youtube.com/watch?v=${videoId}`;
+
+    try {
+        // Dùng execFile thay vì exec để truyền tham số an toàn không qua shell
+        await execFileAsync(getYtDlpPath(), [
+            "--skip-download",
+            "--write-subs",        // Ưu tiên lấy sub do người tạo
+            "--write-auto-subs",   // Lấy cả sub tự động nếu cần
+            "--sub-langs", lang, // Bắt cả mã vùng (vd: en-US, ja-JP)
+            "--sub-format", "json3",
+            "-o", outTemplate,
+            url,
+        ], { timeout: 30000 }); // Timeout sau 30s tránh treo server
+
+        const files = await fsp.readdir(tempDir);
+        const subFiles = files.filter((f) => f.startsWith(uniquePrefix) && f.endsWith(".json3"));
+
+        if (subFiles.length === 0) {
+            throw new Error(`No captions available for language "${lang}".`);
+        }
+
+        // Nếu có nhiều file (ví dụ vừa có ja thủ công, vừa có ja-orig tự động), ưu tiên file khớp tên ngắn nhất (thường là bản chuẩn)
+        subFiles.sort((a, b) => a.length - b.length);
+        const targetFile = path.join(tempDir, subFiles[0]);
+        const rawContent = await fsp.readFile(targetFile, "utf-8");
+
+        // Dọn dẹp toàn bộ file tạm ngay sau khi đọc vào RAM
+        await Promise.all(subFiles.map((f) => fsp.unlink(path.join(tempDir, f)).catch(() => {})));
+
+        return JSON.parse(rawContent);
+    } catch (err: any) {
+        // Đảm bảo dọn rác kể cả khi lỗi
+        const files = await fsp.readdir(tempDir).catch(() => []);
+        await Promise.all(
+            files.filter((f) => f.startsWith(uniquePrefix)).map((f) => fsp.unlink(path.join(tempDir, f)).catch(() => {}))
+        );
+        throw new Error(err?.message || `Failed to fetch json3 via yt-dlp for language "${lang}".`);
+    }
+}
+
+// ==========================================
+// CORE ENGINE 2: Phẳng hóa json3 thành mảng Word-level
+// ==========================================
+function extractWordsFromJson3(rawJson3: any): WordToken[] {
+    const rawWords: { word: string; start: number; eventEnd: number }[] = [];
+
+    for (const event of rawJson3.events || []) {
+        if (!event.segs) continue;
+        const baseStartMs = event.tStartMs ?? 0;
+        const durationMs = event.dDurationMs ?? 2000;
+        const eventEndSec = (baseStartMs + durationMs) / 1000.0;
+
+        for (const seg of event.segs) {
+            const text = (seg.utf8 || "").replace(/\s+/g, " ").trim();
+            if (!text) continue;
+
+            const offsetMs = seg.tOffsetMs ?? 0;
+            const startSec = (baseStartMs + offsetMs) / 1000.0;
+
+            rawWords.push({
+                word: text,
+                start: startSec,
+                eventEnd: eventEndSec,
+            });
+        }
+    }
+
+    // Nội suy thời gian kết thúc (end_time) chuẩn xác cho từng từ
+    const words: WordToken[] = [];
+    for (let i = 0; i < rawWords.length; i++) {
+        const curr = rawWords[i];
+        const next = rawWords[i + 1];
+
+        let endSec = curr.start + 0.35; // Mặc định mỗi âm tiết kéo dài ~0.35s
+        if (next && next.start > curr.start) {
+            // Không bao giờ để thời gian kết thúc của chữ trước đè lên chữ sau, hoặc kéo dài quá 0.6s qua khoảng lặng
+            endSec = Math.min(next.start, curr.start + 0.6, curr.eventEnd);
+        } else {
+            endSec = Math.min(curr.eventEnd, curr.start + 0.6);
+        }
+
+        words.push({
+            word: curr.word,
+            start: Number(curr.start.toFixed(3)),
+            end: Number(Math.max(curr.start + 0.05, endSec).toFixed(3)),
+        });
+    }
+
+    return words;
+}
+
+function joinWords(base: string, word: string, config: LangConfig): string {
+    if (!base) return word;
+    if (!config.joinWithSpace) return base + word;
+    // Với ngôn ngữ có dấu cách (Anh, Việt): Không thêm dấu cách nếu token tiếp theo là dấu câu
+    if (config.dependentMarks.includes(word)) return base + word;
+    return `${base} ${word}`;
+}
+
+// ==========================================
+// MAIN API HANDLER
+// ==========================================
 export async function GET(request: Request) {
     try {
         const { searchParams } = new URL(request.url);
@@ -123,139 +237,132 @@ export async function GET(request: Request) {
             parseDurationParam(searchParams.get("maxDuration"), DEFAULT_MAX_BLOCK_SEC)
         );
 
-        let transcript;
-        try {
-            transcript = await YoutubeTranscript.fetchTranscript(videoId, { lang });
-        } catch {
-            throw new Error(`No captions available for language "${lang}".`);
-        }
-        if (!transcript || transcript.length === 0) throw new Error(`No captions available for language "${lang}".`);
+        // 1. Kéo dữ liệu json3 và giải nén thành từng chữ (Word-level)
+        const rawJson3 = await fetchJson3WithYtDlp(videoId, lang);
+        const words = extractWordsFromJson3(rawJson3);
 
-        const captions: RawCaption[] = transcript.map((t) => ({ ...t, text: cleanText(t.text, config.joinWithSpace) }));
-        for (let i = 0; i < captions.length; i++) {
-            const current = captions[i];
-            const next = captions[i + 1];
-            current.actualEnd = next ? Math.min(current.offset + current.duration, next.offset) : current.offset + current.duration;
+        if (words.length === 0) {
+            throw new Error(`No valid word tokens extracted for language "${lang}".`);
         }
 
-        // Only load the (Japanese-specific) morphological tokenizer when actually needed
         const tokenizer = config.useTokenizer ? await getTokenizer() : null;
 
-        const strongEndRegex = new RegExp(`[${escapeRegexChars(config.strongEnders)}]$`);
-        const carryOverRegex = new RegExp(
-            `(.*[${escapeRegexChars(config.strongEnders)}])([^${escapeRegexChars(config.strongEnders)}]{1,${config.trailingSpan}})$`
-        );
-        const lookaheadRegex = new RegExp(
-            `^([^${escapeRegexChars(config.softEnders)}]{0,${config.leadingSpan}}[${escapeRegexChars(config.softEnders)}])(.*)`
-        );
-
+        // 2. THUẬT TOÁN GOM BLOCK TỪ TỪNG CHỮ (WORD-LEVEL AGGREGATION)
         const blocks: Block[] = [];
+        let currentText = "";
+        let blockStart = -1;
+        let blockEnd = 0;
 
-        let currentBlockText = "";
-        let blockStartTime = captions[0].offset;
+        for (let i = 0; i < words.length; i++) {
+            const w = words[i];
 
-        for (let i = 0; i < captions.length; i++) {
-            const cap = captions[i];
-            currentBlockText = appendText(currentBlockText, cap.text, config.joinWithSpace);
+            // Chống lỗi "dấu câu mồ côi": Nếu đang bắt đầu Block mới mà gặp ngay dấu câu (rớt từ câu trước),
+            // lập tức nhét nó vào đuôi của Block trước đó thay vì mở Block mới bằng dấu chấm!
+            if (currentText === "" && config.dependentMarks.includes(w.word)) {
+                if (blocks.length > 0) {
+                    blocks[blocks.length - 1].text += w.word;
+                    blocks[blocks.length - 1].end = Number(w.end.toFixed(2));
+                }
+                continue;
+            }
 
-            const currentDuration = cap.actualEnd! - blockStartTime;
-            const isLastCaption = i === captions.length - 1;
+            if (currentText === "") {
+                blockStart = w.start;
+            }
+
+            currentText = joinWords(currentText, w.word, config);
+            blockEnd = w.end;
+
+            // --- LOOK-AHEAD: Nhìn trước các token phụ thuộc ---
+            // Nếu token tiếp theo là dấu câu (VD: "こんにちは" rồi đến "。"), BẮT BUỘC phải gom hết vào chung 1 nhịp
+            while (i + 1 < words.length && config.dependentMarks.includes(words[i + 1].word)) {
+                i++;
+                const nextDep = words[i];
+                currentText = joinWords(currentText, nextDep.word, config);
+                blockEnd = nextDep.end;
+            }
+
+            const currentDuration = blockEnd - blockStart;
+            const lastChar = currentText.slice(-1);
+
+            const isStrongEnd = config.strongEnders.includes(lastChar);
+            const isSoftEnd = config.softEnders.includes(lastChar);
+            const isLastWord = i === words.length - 1;
+
+            // Đo khoảng lặng âm thanh thực tế đến chữ tiếp theo
+            const gapToNext = !isLastWord ? words[i + 1].start - blockEnd : 999;
+            const isSilenceGap = gapToNext >= config.silenceThreshold;
 
             let shouldCut = false;
-            let cutText = currentBlockText;
-            let carryOverText = "";
-            let borrowedTime = 0;
 
             // ==========================================
-            // WATERFALL EVALUATION
+            // HỆ THỐNG PHÂN TẦNG QUYẾT ĐỊNH NGẮT BLOCK
             // ==========================================
-            if (currentDuration >= MIN_BLOCK_SEC) {
-                // PRIORITY 1: Perfect end (already ends on a strong sentence-ender)
-                if (strongEndRegex.test(currentBlockText)) {
+            if (isLastWord) {
+                shouldCut = true;
+            }
+            // TẦNG 1: Đã đủ độ dài tối thiểu (MIN_BLOCK_SEC) -> Tìm điểm ngắt câu hoàn hảo
+            else if (currentDuration >= MIN_BLOCK_SEC) {
+                if (isStrongEnd) {
+                    // Cắt ngay lập tức khi gặp dấu kết câu (。！？)
                     shouldCut = true;
-                    cutText = currentBlockText;
-                }
-                // PRIORITY 2: Carry-over (a few trailing units leak past the sentence end)
-                else if (carryOverRegex.exec(currentBlockText)) {
-                    const match = carryOverRegex.exec(currentBlockText);
+                } else if (isSoftEnd && gapToNext >= 0.3) {
+                    // Gặp dấu phẩy (、) kèm theo một nhịp lấy hơi nhẹ
                     shouldCut = true;
-                    cutText = match![1];
-                    carryOverText = match![2];
-                }
-                // PRIORITY 3: Lookahead borrowing (steal the sentence-ender from the next caption)
-                else {
-                    const nextCap = captions[i + 1];
-                    if (nextCap && nextCap.text) {
-                        const match = lookaheadRegex.exec(nextCap.text);
-                        if (match) {
-                            const borrowedText = match[1];
+                } else if (isSilenceGap) {
+                    // AI quên đánh dấu câu nhưng người nói thực sự đã dừng lại nghỉ (Silence Gap)
+                    if (config.useTokenizer && tokenizer) {
+                        const tokens = tokenizer.tokenize(currentText);
+                        const lastToken = tokens[tokens.length - 1];
+                        // Chỉ cắt ở khoảng lặng nếu từ cuối cùng không phải là Tiếp đầu ngữ (接頭詞) đang nói dở
+                        if (lastToken?.pos !== "接頭詞") {
                             shouldCut = true;
-                            cutText = appendText(currentBlockText, borrowedText, config.joinWithSpace);
-
-                            nextCap.text = match[2];
-                            borrowedTime = Math.min(
-                                nextCap.duration * 0.4,
-                                calculateShiftTime(unitLength(borrowedText, config), config.joinWithSpace)
-                            );
-                            nextCap.offset += borrowedTime;
-                            nextCap.duration -= borrowedTime;
                         }
+                    } else {
+                        shouldCut = true;
                     }
                 }
             }
 
-            // ==========================================
-            // PRIORITY 4: Soft cut when a block is running too long
-            // ==========================================
+            // TẦNG 2: Câu quá dài vượt ngưỡng (MAX_BLOCK_SEC) mà người nói không chấm câu -> Ép cắt mềm (Soft Cut)
             if (!shouldCut && currentDuration >= MAX_BLOCK_SEC) {
-                if (config.useTokenizer && tokenizer) {
-                    const tokens = tokenizer.tokenize(currentBlockText);
+                if (isSoftEnd || gapToNext >= 0.25) {
+                    shouldCut = true;
+                } else if (config.useTokenizer && tokenizer) {
+                    // Dùng Kuromoji tìm ranh giới từ loại an toàn để cắt mà không làm gãy từ vựng
+                    const tokens = tokenizer.tokenize(currentText);
                     const lastToken = tokens[tokens.length - 1];
                     const pos = lastToken?.pos;
                     const posDetail = lastToken?.pos_detail_1;
 
                     if (
-                        pos === "動詞" ||
-                        pos === "形容詞" ||
-                        (pos === "助詞" && ["終助詞", "接続助詞", "副助詞"].includes(posDetail)) ||
+                        pos === "助詞" && ["接続助詞", "終助詞", "副助詞", "係助詞"].includes(posDetail) || // Cắt sau các trợ từ nối (て, から, けど, は, も...)
+                        pos === "助動詞" || // Cắt sau trợ động từ (です, ます, た...)
                         (pos === "記号" && posDetail === "読点")
                     ) {
                         shouldCut = true;
-                        cutText = currentBlockText;
                     }
-                } else {
+                }
+
+                // Cắt cưỡng bức bảo vệ UI nếu chạy lố thêm 4 giây mà vẫn chưa tìm được trợ từ
+                if (!shouldCut && currentDuration >= MAX_BLOCK_SEC + 4) {
                     shouldCut = true;
-                    cutText = currentBlockText;
                 }
             }
 
             // ==========================================
-            // FINALIZE BLOCK & RESYNC TIMESTAMPS
+            // ĐÓNG GÓI BLOCK
             // ==========================================
-            if (shouldCut || isLastCaption) {
-                let blockEndTime = cap.actualEnd! + borrowedTime;
-                let dynamicShiftTime = 0;
-
-                if (carryOverText) {
-                    dynamicShiftTime = calculateShiftTime(unitLength(carryOverText, config), config.joinWithSpace, 1.5);
-                    blockEndTime = Math.max(blockStartTime + 1, blockEndTime - dynamicShiftTime);
-                }
-
+            if (shouldCut) {
                 blocks.push({
                     id: `block-${blocks.length + 1}`,
-                    text: cutText.trim(),
-                    start: Number(blockStartTime.toFixed(2)),
-                    end: Number(blockEndTime.toFixed(2)),
+                    text: currentText.trim(),
+                    start: Number(blockStart.toFixed(2)),
+                    end: Number(blockEnd.toFixed(2)),
                 });
 
-                currentBlockText = carryOverText;
-
-                if (!isLastCaption) {
-                    blockStartTime = captions[i + 1].offset;
-                    if (carryOverText) {
-                        blockStartTime = Math.max(0, blockStartTime - dynamicShiftTime);
-                    }
-                }
+                currentText = "";
+                blockStart = -1;
             }
         }
 

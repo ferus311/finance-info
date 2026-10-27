@@ -1,6 +1,6 @@
 'use client';
 
-import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react';
+import { forwardRef, useEffect, useImperativeHandle, useMemo, useState } from 'react';
 
 type DocumentNode = {
     id: string;
@@ -197,18 +197,57 @@ const MindmapDocumentView = forwardRef<MindmapDocumentActions, MindmapDocumentVi
     const [drafts, setDrafts] = useState<Record<string, string>>({});
     const [isSaving, setIsSaving] = useState(false);
     const [saveError, setSaveError] = useState<string | null>(null);
-    const loadingStarted = useRef(false);
+    const [collapseStateLoadedFor, setCollapseStateLoadedFor] = useState<string | null>(null);
 
     useEffect(() => {
-        if (loading) {
-            loadingStarted.current = true;
-            return;
+        const notebookId = notebook?.id;
+        if (loading || !notebookId || collapseStateLoadedFor === notebookId) return;
+
+        let cancelled = false;
+        queueMicrotask(() => {
+            let collapsed = new Set<string>();
+            const storageKey = `mindmap-document-collapsed-nodes:${notebookId}`;
+            try {
+                const stored = window.localStorage.getItem(storageKey);
+                if (stored === null) {
+                    collapsed = getInitiallyCollapsedIds(childrenByParent);
+                } else {
+                    const parsed: unknown = JSON.parse(stored);
+                    if (Array.isArray(parsed)) {
+                        const parentsWithChildren = new Set(
+                            [...childrenByParent.entries()]
+                                .filter(([, children]) => children.length > 0)
+                                .map(([id]) => id)
+                                .filter((id): id is string => id !== null),
+                        );
+                        collapsed = new Set(
+                            parsed.filter((id): id is string => typeof id === 'string' && parentsWithChildren.has(id)),
+                        );
+                    }
+                }
+            } catch (error) {
+                console.error(`Could not load ${storageKey}.`, error);
+            }
+            if (!cancelled) {
+                setCollapsedIds(collapsed);
+                setCollapseStateLoadedFor(notebookId);
+            }
+        });
+        return () => { cancelled = true; };
+    }, [childrenByParent, collapseStateLoadedFor, loading, notebook]);
+
+    useEffect(() => {
+        const notebookId = notebook?.id;
+        if (!notebookId || loading || collapseStateLoadedFor !== notebookId) return;
+        try {
+            window.localStorage.setItem(
+                `mindmap-document-collapsed-nodes:${notebookId}`,
+                JSON.stringify([...collapsedIds]),
+            );
+        } catch (error) {
+            console.error(`Could not save document collapse state for ${notebookId}.`, error);
         }
-        if (loadingStarted.current && nodes.length > 0) {
-            setCollapsedIds(getInitiallyCollapsedIds(childrenByParent));
-            loadingStarted.current = false;
-        }
-    }, [childrenByParent, loading, nodes.length]);
+    }, [collapseStateLoadedFor, collapsedIds, loading, notebook?.id]);
 
     function toggleNode(id: string) {
         setCollapsedIds((previous) => {

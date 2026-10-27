@@ -19,6 +19,7 @@ import { usePathname, useRouter } from 'next/navigation';
 import './layout.style.css';
 
 const { Header, Content, Sider } = Layout;
+const APP_SIDEBAR_COLLAPSED_KEY = 'app-sidebar-collapsed';
 
 type AppMenuItem = {
     key: string;
@@ -89,6 +90,8 @@ const MainLayout: React.FC<MainLayoutProps> = ({ children }) => {
         token: { colorBgContainer, borderRadiusLG },
     } = theme.useToken();
     const [collapsed, setCollapsed] = React.useState(false);
+    const [isTabletViewport, setIsTabletViewport] = React.useState(false);
+    const [sidebarPreferenceLoaded, setSidebarPreferenceLoaded] = React.useState(false);
     const [mobileSidebarOpen, setMobileSidebarOpen] = React.useState(false);
     const [checkingAuth, setCheckingAuth] = React.useState(true);
     const pathname = usePathname();
@@ -101,6 +104,41 @@ const MainLayout: React.FC<MainLayoutProps> = ({ children }) => {
     }, [pathname]);
 
     const isMindmapRoute = pathname === '/mindmap';
+
+    React.useEffect(() => {
+        const breakpoint = window.matchMedia('(max-width: 991px)');
+        const updateBreakpoint = (event: MediaQueryListEvent) => setIsTabletViewport(event.matches);
+        let active = true;
+
+        breakpoint.addEventListener('change', updateBreakpoint);
+        queueMicrotask(() => {
+            if (!active) return;
+            try {
+                const savedSidebarCollapsed = window.localStorage.getItem(APP_SIDEBAR_COLLAPSED_KEY);
+                if (savedSidebarCollapsed === 'true' || savedSidebarCollapsed === 'false') {
+                    setCollapsed(savedSidebarCollapsed === 'true');
+                }
+            } catch (error) {
+                console.error('Could not load the app sidebar preference.', error);
+            } finally {
+                setIsTabletViewport(breakpoint.matches);
+                setSidebarPreferenceLoaded(true);
+            }
+        });
+        return () => {
+            active = false;
+            breakpoint.removeEventListener('change', updateBreakpoint);
+        };
+    }, []);
+
+    React.useEffect(() => {
+        if (!sidebarPreferenceLoaded) return;
+        try {
+            window.localStorage.setItem(APP_SIDEBAR_COLLAPSED_KEY, String(collapsed));
+        } catch (error) {
+            console.error('Could not save the app sidebar preference.', error);
+        }
+    }, [collapsed, sidebarPreferenceLoaded]);
 
     React.useEffect(() => {
         setMobileSidebarOpen(false);
@@ -122,7 +160,7 @@ const MainLayout: React.FC<MainLayoutProps> = ({ children }) => {
         router.refresh();
     };
 
-    if (checkingAuth) {
+    if (checkingAuth || !sidebarPreferenceLoaded) {
         return <div style={{ minHeight: '100vh', display: 'grid', placeItems: 'center' }}>Loading...</div>;
     }
 
@@ -170,9 +208,8 @@ const MainLayout: React.FC<MainLayoutProps> = ({ children }) => {
                     className={`app-main-sider${mobileSidebarOpen ? ' app-main-sider-open' : ''}`}
                     width={220}
                     collapsedWidth={80}
-                    breakpoint="lg"
                     collapsible
-                    collapsed={mobileSidebarOpen ? false : collapsed}
+                    collapsed={mobileSidebarOpen ? false : isTabletViewport || collapsed}
                     onCollapse={(value) => setCollapsed(value)}
                     style={{
                         background: colorBgContainer,
