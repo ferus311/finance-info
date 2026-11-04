@@ -220,8 +220,9 @@ const MainLayout: React.FC<MainLayoutProps> = ({ children }) => {
                     <Menu
                         mode="inline"
                         theme="light"
+                        triggerSubMenuAction="click"
                         selectedKeys={activeMenuKey ? [activeMenuKey] : []}
-                        defaultOpenKeys={['work', 'study']}
+                        // defaultOpenKeys={['study']}
                         style={{
                             height: '100%',
                             borderInlineEnd: 0,

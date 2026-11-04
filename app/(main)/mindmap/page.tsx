@@ -43,6 +43,7 @@ type SidebarDrop = { kind: 'notebook' | 'group'; id: string; position: 'before' 
 type MindNode = {
     id: string; notebookId: string; parentId: string | null;
     text: string; sourceText: string; sourceLanguage: Language; x: number; y: number;
+    displayLanguage: Language; hasLocalizedText: boolean; textEditVersion: number;
     type: 'text' | 'image'; width: number; height: number; autoWidth: boolean;
     imageUrl: string | null; preserveAspect: boolean; color: string | null;
     textAlign: 'left' | 'center' | 'right';
@@ -54,14 +55,15 @@ type MindNodeResponse = {
     width: number; height: number; auto_width?: number | null;
     image_url: string | null; preserve_aspect?: number | null;
     color: string | null; text_align?: 'left' | 'center' | 'right' | null;
-    display_text?: string; translation_pending?: number;
+    display_text?: string; has_translation?: number; translation_pending?: number;
 };
 
-function mapMindNode(node: MindNodeResponse): MindNode {
+function mapMindNode(node: MindNodeResponse, language: Language): MindNode {
     return {
         id: node.id, notebookId: node.notebook_id, parentId: node.parent_id,
         text: node.display_text ?? node.text, sourceText: node.text,
         sourceLanguage: node.source_language ?? 'vi', x: node.x, y: node.y,
+        displayLanguage: language, hasLocalizedText: Boolean(node.has_translation), textEditVersion: 0,
         type: (node.type as 'text' | 'image') || 'text', width: node.width, height: node.height,
         autoWidth: Boolean(node.auto_width ?? 1), imageUrl: node.image_url,
         preserveAspect: Boolean(node.preserve_aspect ?? 1), color: node.color,
@@ -79,7 +81,7 @@ const HISTORY_COMMIT_DELAY = 180; // gom sửa text + tạo node + relayout thà
 const HISTORY_SYNC_DELAY = 350;   // gom nhiều lần undo/redo liên tiếp thành 1 request
 const POSITION_SAVE_DELAY = 250;
 
-const TRACKED_FIELDS = ['parentId', 'sourceText', 'sourceLanguage', 'x', 'y', 'type', 'width', 'height', 'autoWidth', 'imageUrl', 'preserveAspect', 'color', 'textAlign'] as const;
+const TRACKED_FIELDS = ['parentId', 'sourceText', 'sourceLanguage', 'textEditVersion', 'x', 'y', 'type', 'width', 'height', 'autoWidth', 'imageUrl', 'preserveAspect', 'color', 'textAlign'] as const;
 
 const changeId = (change: NodeChange) => (change.before ?? change.after)!.id;
 
@@ -105,19 +107,26 @@ function describeChanges(changes: NodeChange[]): string {
     if (deleted) return deleted > 1 ? `delete ${deleted} nodes` : 'delete node';
     if (changes.some((c) => !c.before)) return 'add node';
     const updated = changes.filter((c): c is { before: MindNode; after: MindNode } => Boolean(c.before && c.after));
-    if (updated.some(({ before, after }) => before.sourceText !== after.sourceText)) return 'edit text';
+    if (updated.some(({ before, after }) => before.textEditVersion !== after.textEditVersion || before.sourceText !== after.sourceText)) return 'edit text';
     if (updated.some(({ before, after }) => before.parentId !== after.parentId)) return 'change parent';
     if (updated.some(({ before, after }) => before.width !== after.width || before.height !== after.height)) return 'resize';
     if (updated.some(({ before, after }) => before.color !== after.color || before.textAlign !== after.textAlign)) return 'format';
     return 'move node';
 }
 
-// Giữ text đang hiển thị (có thể là bản dịch) nếu nội dung gốc không đổi.
 function restoreNode(target: MindNode, current?: MindNode): MindNode {
-    if (current && current.sourceText === target.sourceText && current.sourceLanguage === target.sourceLanguage) {
-        return { ...target, text: current.text, translationPending: current.translationPending };
+    if (current
+        && current.sourceText === target.sourceText
+        && current.sourceLanguage === target.sourceLanguage
+        && current.textEditVersion === target.textEditVersion) {
+        return {
+            ...target,
+            text: current.text,
+            hasLocalizedText: current.hasLocalizedText,
+            translationPending: current.translationPending,
+        };
     }
-    return { ...target, text: target.sourceText, translationPending: Boolean(target.sourceText.trim()) };
+    return target;
 }
 
 function toSyncPayload(targets: Map<string, MindNode | null>) {
@@ -138,7 +147,8 @@ function toSyncPayload(targets: Map<string, MindNode | null>) {
     return {
         remove,
         upsert: upsert.map((n) => ({
-            id: n.id, parentId: n.parentId, text: n.sourceText, language: n.sourceLanguage, x: n.x, y: n.y,
+            id: n.id, parentId: n.parentId, text: n.text, language: n.displayLanguage,
+            hasLocalizedText: n.hasLocalizedText, x: n.x, y: n.y,
             type: n.type, width: n.width, height: n.height, autoWidth: n.autoWidth, imageUrl: n.imageUrl,
             preserveAspect: n.preserveAspect, color: n.color, textAlign: n.textAlign,
         })),
@@ -331,18 +341,21 @@ export default function MindmapPage() {
     const [editingNotebookId, setEditingNotebookId] = useState<string | null>(null);
     const [sidebarDrag, setSidebarDrag] = useState<SidebarDrag | null>(null);
     const [sidebarDrop, setSidebarDrop] = useState<SidebarDrop | null>(null);
-    const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+    const [isSidebarOpen, setIsSidebarOpen] = useState(false);
     const [recentlyDeletedNotebook, setRecentlyDeletedNotebook] = useState<Notebook | null>(null);
 
     const [nodes, setNodes] = useState<MindNode[]>([]);
     const [selectedId, setSelectedId] = useState<string | null>(null);
     const [editingId, setEditingId] = useState<string | null>(null);
     const [contextMenu, setContextMenu] = useState<{ x: number; y: number; nodeId: string } | null>(null);
+    const [flashcardNodeId, setFlashcardNodeId] = useState<string | null>(null);
+    const [flashcardContextDepth, setFlashcardContextDepth] = useState(1);
+    const [savingFlashcard, setSavingFlashcard] = useState(false);
     const [notebookContextMenu, setNotebookContextMenu] = useState<{ x: number; y: number; notebookId: string } | null>(null);
     const [descriptionEditor, setDescriptionEditor] = useState<{ notebookId: string; value: string } | null>(null);
     const [isTranslating, setIsTranslating] = useState(false);
     const [translatingNodeId, setTranslatingNodeId] = useState<string | null>(null);
-    const [translationTargetLanguage, setTranslationTargetLanguage] = useState<Language>('en');
+    const [translationTargetLanguage, setTranslationTargetLanguage] = useState<Language>('vi');
     const [translationProvider, setTranslationProvider] = useState<AIProvider>('openai');
     const [translationModel, setTranslationModel] = useState(AI_MODELS.openai[0].id);
     const [nodeComparisons, setNodeComparisons] = useState<Record<string, NodeComparison>>({});
@@ -394,7 +407,7 @@ export default function MindmapPage() {
         queueMicrotask(() => {
             try {
                 const savedSidebarOpen = window.localStorage.getItem(MINDMAP_SIDEBAR_OPEN_KEY);
-                if (savedSidebarOpen === 'true' || savedSidebarOpen === 'false') setIsSidebarOpen(savedSidebarOpen === 'true');
+                setIsSidebarOpen(savedSidebarOpen !== 'false');
             } catch (error) {
                 console.error('Could not load the mindmap sidebar preference.', error);
             }
@@ -570,7 +583,7 @@ export default function MindmapPage() {
             try {
                 const data = await apiFetch(`${API_BASE}?resource=nodes&notebookId=${activeNotebookId}&language=${activeLanguage}`) as { nodes: MindNodeResponse[] };
                 if (cancelled) return;
-                const mapped = data.nodes.map(mapMindNode);
+                const mapped = data.nodes.map((node) => mapMindNode(node, activeLanguage));
                 const parentsWithChildren = new Set(mapped.flatMap((node) => node.parentId ? [node.parentId] : []));
                 const savedCollapsedIds = readStoredStringSet(`mindmap-collapsed-nodes:${activeNotebookId}`);
                 setCollapsedNodeIds(new Set([...savedCollapsedIds].filter((id) => parentsWithChildren.has(id))));
@@ -703,6 +716,33 @@ export default function MindmapPage() {
         setNodes(next);
     }
 
+    async function saveFlashcardFromNode() {
+        const node = nodes.find((item) => item.id === flashcardNodeId);
+        if (!node) return;
+        setSavingFlashcard(true);
+        try {
+            await apiSend('POST', {
+                resource: 'flashcard',
+                nodeId: node.id,
+                language: node.displayLanguage,
+                front: node.text || (node.type === 'image' ? 'Image attachment' : ''),
+                context: flashcardContext,
+                children: flashcardChildren
+                    .map((child) => ({
+                        id: child.id,
+                        text: child.text.trim() || (child.type === 'image' ? 'Image attachment' : ''),
+                    }))
+                    .filter((child) => child.text),
+            });
+            setFlashcardNodeId(null);
+            setHistoryToast('Flashcard added to your mindmap deck.');
+        } catch (saveError) {
+            setError(saveError instanceof Error ? saveError.message : 'Could not create flashcard.');
+        } finally {
+            setSavingFlashcard(false);
+        }
+    }
+
     // ───── Hàng đợi ghi: thứ tự request trên server = thứ tự thao tác trên UI ─────
     function enqueueWrite<T>(task: () => Promise<T>): Promise<T> {
         const run = writeQueueRef.current.then(task, task);
@@ -783,8 +823,8 @@ export default function MindmapPage() {
         try {
             await writeQueueRef.current;
             const data = await apiFetch(`${API_BASE}?resource=nodes&notebookId=${notebookId}&language=${language}`) as { nodes: MindNodeResponse[] };
-            if (activeViewRef.current.notebookId !== notebookId) return;
-            const mapped = data.nodes.map(mapMindNode);
+            if (activeViewRef.current.notebookId !== notebookId || activeViewRef.current.language !== language) return;
+            const mapped = data.nodes.map((node) => mapMindNode(node, language));
             applyNodes(mapped);
             resetHistory(mapped);
         } catch { /* giữ nguyên UI hiện tại */ }
@@ -839,7 +879,9 @@ export default function MindmapPage() {
 
         // UI: bỏ trạng thái cũ, chọn node liên quan, cuộn tới nó, báo toast
         const textChangedIds = new Set(entry.changes
-            .filter((c) => c.before && c.after && c.before.sourceText !== c.after.sourceText).map(changeId));
+            .filter((c) => c.before && c.after
+                && (c.before.textEditVersion !== c.after.textEditVersion
+                    || c.before.sourceText !== c.after.sourceText)).map(changeId));
         if (textChangedIds.size > 0) {
             setNodeComparisons((previous) => {
                 const rest = { ...previous };
@@ -899,10 +941,13 @@ export default function MindmapPage() {
                     const refreshed = await apiFetch(`${API_BASE}?resource=nodes&notebookId=${notebookId}&language=${view.language}`) as { nodes: MindNodeResponse[] };
                     if (activeViewRef.current.notebookId === notebookId && activeViewRef.current.language === view.language) {
                         // Chỉ merge phần hiển thị, không ghi đè vị trí/trạng thái cục bộ
-                        const fresh = new Map(refreshed.nodes.map((n) => [n.id, mapMindNode(n)]));
+                        const fresh = new Map(refreshed.nodes.map((n) => [n.id, mapMindNode(n, view.language)]));
                         applyNodes(nodesRef.current.map((n) => {
                             const f = fresh.get(n.id);
-                            return f ? { ...n, text: f.text, translationPending: f.translationPending } : n;
+                            return f ? {
+                                ...n, text: f.text, hasLocalizedText: f.hasLocalizedText,
+                                translationPending: f.translationPending,
+                            } : n;
                         }));
                     }
                 }
@@ -1007,7 +1052,7 @@ export default function MindmapPage() {
             await apiSend('POST', { resource: 'notebook', id, title: cleanTitle, rootId, groupName, language: activeLanguage });
             setNotebooks((prev) => [...prev, { id, title: cleanTitle, groupName, language: activeLanguage, description: '', sortOrder: prev.filter((item) => item.groupName === groupName).length }]);
             setActiveNotebookId(id);
-            const rootNode: MindNode = { id: rootId, notebookId: id, parentId: null, text: ROOT_TEXT[activeLanguage], sourceText: ROOT_TEXT[activeLanguage], sourceLanguage: activeLanguage, x: 0, y: 0, type: 'text', width: DEFAULT_W, height: DEFAULT_H, autoWidth: true, imageUrl: null, preserveAspect: true, color: null, textAlign: 'center', translationPending: true };
+            const rootNode: MindNode = { id: rootId, notebookId: id, parentId: null, text: ROOT_TEXT[activeLanguage], sourceText: ROOT_TEXT[activeLanguage], sourceLanguage: activeLanguage, displayLanguage: activeLanguage, hasLocalizedText: true, textEditVersion: 0, x: 0, y: 0, type: 'text', width: DEFAULT_W, height: DEFAULT_H, autoWidth: true, imageUrl: null, preserveAspect: true, color: null, textAlign: 'center', translationPending: true };
             applyNodes([rootNode]); resetHistory([rootNode]);
             setPan(DEFAULT_PAN); setZoom(1);
         } catch {
@@ -1158,6 +1203,7 @@ export default function MindmapPage() {
         const newNode: MindNode = {
             id: newNodeId, notebookId: activeNotebookId, parentId, text,
             sourceText: text, sourceLanguage: activeLanguage,
+            displayLanguage: activeLanguage, hasLocalizedText: true, textEditVersion: 0,
             x: initialX, y: initialY, type, width, height, autoWidth: true, imageUrl, preserveAspect: true, color: null, textAlign: 'center', translationPending: false,
         };
 
@@ -1195,6 +1241,7 @@ export default function MindmapPage() {
         const currentNode = beforeNodes.find((node) => node.id === id);
         if (!currentNode) return;
         const textChanged = typeof updates.text === 'string' && updates.text !== currentNode.text;
+        const sourceTextChanged = textChanged && activeLanguage === currentNode.sourceLanguage;
         const savedUpdates: Partial<MindNode> = updates.text !== undefined && currentNode.autoWidth
             ? { ...updates, width: getAutoNodeWidth(updates.text) }
             : updates;
@@ -1204,8 +1251,15 @@ export default function MindmapPage() {
 
         applyNodes(beforeNodes.map((node) => node.id === id ? {
             ...node, ...savedUpdates,
-            ...(textChanged ? { sourceText: updates.text!, sourceLanguage: activeLanguage } : {}),
-            translationPending: textChanged ? Boolean(updates.text?.trim()) : node.translationPending,
+            ...(sourceTextChanged
+                ? { sourceText: updates.text!, sourceLanguage: activeLanguage }
+                : {}),
+            ...(textChanged ? {
+                displayLanguage: activeLanguage,
+                hasLocalizedText: true,
+                textEditVersion: node.textEditVersion + 1,
+            } : {}),
+            translationPending: sourceTextChanged ? Boolean(updates.text?.trim()) : node.translationPending,
         } : node));
         if (textChanged) {
             setNodeComparisons((previous) => {
@@ -1478,6 +1532,33 @@ export default function MindmapPage() {
     const pendingTranslationCount = nodes.filter((node) => node.translationPending).length;
     const forceTranslationCount = nodes.filter((node) => node.text.trim()).length;
     const contextNode = contextMenu ? nodes.find((node) => node.id === contextMenu.nodeId) : undefined;
+    const flashcardNode = flashcardNodeId ? nodes.find((node) => node.id === flashcardNodeId) : undefined;
+    const flashcardChildren = flashcardNode
+        ? nodes.filter((node) => node.parentId === flashcardNode.id).sort((a, b) => a.y - b.y)
+        : [];
+    const flashcardBackItems = flashcardChildren
+        .map((node) => node.text.trim() || (node.type === 'image' ? 'Image attachment' : ''))
+        .filter(Boolean);
+    const flashcardAncestors = useMemo(() => {
+        if (!flashcardNode) return [];
+        const byId = new Map(nodes.map((node) => [node.id, node]));
+        const ancestors: MindNode[] = [];
+        const seen = new Set([flashcardNode.id]);
+        let parentId = flashcardNode.parentId;
+        while (parentId && !seen.has(parentId)) {
+            seen.add(parentId);
+            const parent = byId.get(parentId);
+            if (!parent) break;
+            ancestors.push(parent);
+            parentId = parent.parentId;
+        }
+        return ancestors.reverse();
+    }, [flashcardNode, nodes]);
+    const flashcardContext = flashcardAncestors
+        .slice(flashcardContextDepth > 0 ? -flashcardContextDepth : flashcardAncestors.length)
+        .map((node) => node.text.trim())
+        .filter(Boolean)
+        .join('_');
 
     return (
         <div className={`${manrope.variable} ${inter.variable} flex h-full min-h-0 w-full min-w-0 overflow-hidden bg-[#FAFAFC]`} style={{ fontFamily: 'var(--font-ui)' }}>
@@ -1944,6 +2025,23 @@ export default function MindmapPage() {
 
             {contextMenu && (
                 <div ref={contextMenuRef} style={{ position: 'fixed', left: contextMenu.x, top: contextMenu.y }} className="z-50 max-h-[calc(100vh-1rem)] w-56 overflow-y-auto rounded-xl border border-[#E4E4ED] bg-white py-1.5 shadow-xl text-black">
+                    <button
+                        type="button"
+                        disabled={(!contextNode?.text.trim() && contextNode?.type !== 'image') || !nodes.some((node) => node.parentId === contextMenu.nodeId)}
+                        onClick={() => {
+                            setFlashcardContextDepth(1);
+                            setFlashcardNodeId(contextMenu.nodeId);
+                            setContextMenu(null);
+                        }}
+                        className="flex w-full items-center gap-2 px-3 py-2.5 text-left text-sm font-semibold text-[#4B33E0] transition-colors hover:bg-[#F2F1FA] disabled:cursor-not-allowed disabled:text-[#A5A4B5] disabled:hover:bg-white"
+                    >
+                        <span aria-hidden="true" className="flex h-7 w-7 items-center justify-center rounded-lg bg-[#EFECFF] text-base">✦</span>
+                        <span>
+                            <span className="block">Create mindmap flashcard</span>
+                            <span className="mt-0.5 block text-[11px] font-normal text-[#777687]">Use this node as the front</span>
+                        </span>
+                    </button>
+                    <div className="mx-3 my-1 h-px bg-[#EEEDF6]" />
                     <div className="border-y border-[#EEEDF6] px-3 py-2.5">
                         <label className="mb-2 block text-xs font-semibold text-[#626174]" htmlFor="node-translation-language">Translate this note to</label>
                         <select
@@ -2069,6 +2167,93 @@ export default function MindmapPage() {
                         <div className="mt-4 flex justify-end gap-2">
                             <button onClick={() => setDescriptionEditor(null)} className="h-9 rounded-lg px-3 text-sm font-semibold text-[#626174] hover:bg-[#F2F1FA]">Cancel</button>
                             <button onClick={() => void saveNotebookDescription()} className="h-9 rounded-lg bg-[#2B2A3D] px-4 text-sm font-semibold text-white hover:bg-[#424153]">Save</button>
+                        </div>
+                    </section>
+                </div>
+            )}
+
+            {flashcardNodeId && (
+                <div
+                    className="fixed inset-0 z-[60] flex items-center justify-center bg-[#171625]/35 p-4 backdrop-blur-[2px]"
+                    onPointerDown={(event) => {
+                        if (event.target === event.currentTarget && !savingFlashcard) setFlashcardNodeId(null);
+                    }}
+                >
+                    <section
+                        role="dialog"
+                        aria-modal="true"
+                        aria-labelledby="mindmap-flashcard-title"
+                        className="max-h-[min(90vh,48rem)] w-full max-w-xl overflow-y-auto rounded-2xl border border-[#E7E4F3] bg-white p-5 shadow-2xl sm:p-7"
+                    >
+                        <div className="mb-5 flex items-start justify-between gap-4">
+                            <div>
+                                <p className="mb-1 text-xs font-bold uppercase tracking-[0.16em] text-[#7B61FF]">Mindmap · Flashcard</p>
+                                <h2 id="mindmap-flashcard-title" className="text-xl font-bold text-[#201F2E]">Create flashcard</h2>
+                                <p className="mt-1 text-sm text-[#777687]">This node is the front; its direct children are the back.</p>
+                            </div>
+                            <button
+                                type="button"
+                                aria-label="Close"
+                                disabled={savingFlashcard}
+                                onClick={() => setFlashcardNodeId(null)}
+                                className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-lg text-xl text-[#777687] hover:bg-[#F2F1FA] disabled:opacity-50"
+                            >
+                                ×
+                            </button>
+                        </div>
+
+                        <label htmlFor="flashcard-context-depth" className="mb-2 block text-sm font-semibold text-[#333244]">Context from parent nodes</label>
+                        <select
+                            id="flashcard-context-depth"
+                            value={flashcardContextDepth}
+                            onChange={(event) => setFlashcardContextDepth(Number(event.target.value))}
+                            className="mb-5 h-10 w-full rounded-lg border border-[#DEDCEB] bg-white px-3 text-sm text-[#333244] outline-none focus:border-[#7B61FF] focus:ring-2 focus:ring-[#7B61FF]/15"
+                        >
+                            <option value={0}>No parent context</option>
+                            <option value={1}>Include the direct parent</option>
+                            <option value={2}>Include two parent levels (joined with _)</option>
+                        </select>
+
+                        <div className="space-y-3">
+                            <div className="rounded-xl border border-violet-100 bg-violet-50/70 p-4">
+                                <p className="mb-2 text-[11px] font-bold uppercase tracking-wider text-violet-700">Front</p>
+                                {flashcardContext && <p className="mb-2 break-words text-xs font-medium text-violet-600">{flashcardContext}</p>}
+                                <p className="whitespace-pre-wrap break-words text-base font-semibold leading-relaxed text-[#25233A]">{flashcardNode?.text || 'Image attachment'}</p>
+                            </div>
+                            <div className="rounded-xl border border-emerald-100 bg-emerald-50/60 p-4">
+                                <p className="mb-2 text-[11px] font-bold uppercase tracking-wider text-emerald-700">Back · {flashcardBackItems.length} child nodes</p>
+                                {flashcardBackItems.length > 0 ? (
+                                    <ul className="space-y-2">
+                                        {flashcardBackItems.map((child, index) => (
+                                            <li key={`${flashcardNodeId}-${index}`} className="flex gap-2 text-sm leading-relaxed text-[#333244]">
+                                                <span aria-hidden="true" className="mt-2 h-1.5 w-1.5 flex-shrink-0 rounded-full bg-emerald-500" />
+                                                <span className="whitespace-pre-wrap break-words">{child}</span>
+                                            </li>
+                                        ))}
+                                    </ul>
+                                ) : (
+                                    <p className="text-sm text-amber-700">Add at least one child node to create the back of this card.</p>
+                                )}
+                            </div>
+                        </div>
+
+                        <div className="mt-6 flex justify-end gap-2">
+                            <button
+                                type="button"
+                                disabled={savingFlashcard}
+                                onClick={() => setFlashcardNodeId(null)}
+                                className="h-10 rounded-lg px-4 text-sm font-semibold text-[#626174] hover:bg-[#F2F1FA] disabled:opacity-50"
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                type="button"
+                                disabled={savingFlashcard || (!flashcardNode?.text.trim() && flashcardNode?.type !== 'image') || flashcardBackItems.length === 0}
+                                onClick={() => void saveFlashcardFromNode()}
+                                className="h-10 rounded-lg bg-[#5B45E5] px-4 text-sm font-semibold text-white shadow-sm hover:bg-[#4934D3] disabled:cursor-not-allowed disabled:opacity-50"
+                            >
+                                {savingFlashcard ? 'Saving…' : 'Save flashcard'}
+                            </button>
                         </div>
                     </section>
                 </div>

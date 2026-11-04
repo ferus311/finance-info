@@ -23,6 +23,7 @@ import {
 } from "antd";
 
 type Language = "en" | "ja";
+type DeckType = "vocabulary" | "mindmap";
 type Rating = "again" | "hard" | "good" | "easy";
 type Example = { sentence: string; translation: string };
 type VocabularyEntry = {
@@ -34,6 +35,16 @@ type VocabularyEntry = {
     description: string;
     examples: Example[];
 };
+type MindmapFlashcardEntry = {
+    id: string;
+    language: "en" | "ja" | "vi";
+    notebookId: string;
+    notebookTitle: string;
+    nodeId: string;
+    front: string;
+    context: string;
+    children: string[];
+};
 type Schedule = {
     dueAt: string;
     intervalDays: number;
@@ -42,58 +53,98 @@ type Schedule = {
     lapses: number;
     lastReviewedAt: string | null;
 };
+type StudyCard =
+    | { type: "vocabulary"; entry: VocabularyEntry; state: Schedule | null }
+    | { type: "mindmap"; entry: MindmapFlashcardEntry; state: Schedule | null };
+type NotebookSummary = { id: string; title: string; total: number; newCount: number; dueCount: number };
 type StudyData = {
-    language: Language;
     total: number;
     newCount: number;
     dueCount: number;
-    cards: Array<{ entry: VocabularyEntry; state: Schedule | null }>;
+    cards: StudyCard[];
+    notebooks?: NotebookSummary[];
 };
 
-const ratingOptions: Array<{ value: Rating; label: string; description: string }> = [
-    { value: "again", label: "Again", description: "10 phút" },
-    { value: "hard", label: "Hard", description: "Khó" },
-    { value: "good", label: "Good", description: "Ổn" },
-    { value: "easy", label: "Easy", description: "Dễ" },
+const ratingOptions: Array<{ value: Rating; label: string }> = [
+    { value: "again", label: "Again" },
+    { value: "hard", label: "Hard" },
+    { value: "good", label: "Good" },
+    { value: "easy", label: "Easy" },
 ];
+
+function getRepeatTime(state: Schedule | null, rating: Rating) {
+    const repetitions = state?.repetitions ?? 0;
+    const interval = state?.intervalDays ?? 0;
+    const ease = state?.easeFactor ?? 2.5;
+    if (rating === "again") return "10 min";
+
+    const days = rating === "hard"
+        ? repetitions === 0 ? 1 : Math.max(1, Math.round(interval * 1.2))
+        : rating === "good"
+            ? repetitions === 0 ? 1 : repetitions === 1 ? 3 : Math.max(1, Math.round(interval * ease))
+            : repetitions === 0 ? 4 : Math.max(1, Math.round(interval * ease * 1.3));
+    return `${days} ${days === 1 ? "day" : "days"}`;
+}
 
 const FlashcardsPage = () => {
     const [language, setLanguage] = React.useState<Language>("en");
-    const [session, setSession] = React.useState<StudyData | null>(null);
+    const [deckType, setDeckType] = React.useState<DeckType>("vocabulary");
+    const [selectedNotebookId, setSelectedNotebookId] = React.useState<string | null>(null);
+    const [session, setSession] = React.useState<(StudyData & {
+        deckType: DeckType;
+        language: Language;
+        notebookId: string | null;
+    }) | null>(null);
     const [loading, setLoading] = React.useState(true);
     const [loadError, setLoadError] = React.useState("");
     const [revealed, setRevealed] = React.useState(false);
     const [rating, setRating] = React.useState<Rating | null>(null);
     const [messageApi, contextHolder] = message.useMessage();
 
-    React.useEffect(() => {
-        let cancelled = false;
-        fetch(`/api/flashcards?language=${language}`, { cache: "no-store" })
-            .then(async (response) => {
-                const payload = await response.json() as StudyData & { error?: string };
-                if (!response.ok) throw new Error(payload.error || "Không thể tải thẻ ôn tập.");
-                if (!cancelled) {
-                    setSession({ ...payload, language });
-                    setRevealed(false);
-                }
-            })
-            .catch((error: unknown) => {
-                if (!cancelled) {
-                    const errorText = error instanceof Error ? error.message : "Không thể tải thẻ ôn tập.";
-                    setLoadError(errorText);
-                    messageApi.error(errorText);
-                }
-            })
-            .finally(() => {
-                if (!cancelled) setLoading(false);
-            });
-        return () => { cancelled = true; };
-    }, [language, messageApi]);
+    const refreshSession = React.useCallback(async (showSpinner = true, signal?: AbortSignal) => {
+        if (showSpinner) setLoading(true);
+        setLoadError("");
+        const params = new URLSearchParams({ deck: deckType });
+        if (deckType === "vocabulary") params.set("language", language);
+        if (deckType === "mindmap" && selectedNotebookId) params.set("notebookId", selectedNotebookId);
+        try {
+            const response = await fetch(`/api/flashcards?${params}`, { cache: "no-store", signal });
+            const payload = await response.json() as StudyData & { error?: string };
+            if (!response.ok) throw new Error(payload.error || "Could not load flashcards.");
+            setSession({ ...payload, deckType, language, notebookId: selectedNotebookId });
+            setRevealed(false);
+        } catch (error) {
+            if (error instanceof DOMException && error.name === "AbortError") return;
+            const errorText = error instanceof Error ? error.message : "Could not load flashcards.";
+            setLoadError(errorText);
+            messageApi.error(errorText);
+        } finally {
+            if (showSpinner && !signal?.aborted) setLoading(false);
+        }
+    }, [deckType, language, messageApi, selectedNotebookId]);
 
-    const activeSession = session?.language === language ? session : null;
+    React.useEffect(() => {
+        const controller = new AbortController();
+        let active = true;
+        queueMicrotask(() => {
+            if (active) void refreshSession(true, controller.signal);
+        });
+        return () => {
+            active = false;
+            controller.abort();
+        };
+    }, [refreshSession]);
+
+    const activeSession = session?.deckType === deckType
+        && session.language === language
+        && session.notebookId === selectedNotebookId
+        ? session
+        : null;
+    const availableNotebooks = session?.deckType === "mindmap" ? session.notebooks ?? [] : [];
     const currentCard = activeSession?.cards[0] ?? null;
     const studiedCount = activeSession ? activeSession.total - activeSession.newCount - activeSession.dueCount : 0;
     const progress = activeSession?.total ? Math.round((studiedCount / activeSession.total) * 100) : 0;
+    const isStudying = !loading && !loadError && !!currentCard;
 
     const submitRating = async (selectedRating: Rating) => {
         if (!currentCard) return;
@@ -103,21 +154,17 @@ const FlashcardsPage = () => {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
-                    targetLanguage: language,
+                    targetLanguage: currentCard.type === "mindmap" ? currentCard.entry.language : language,
                     entryId: currentCard.entry.id,
+                    cardType: currentCard.type,
                     rating: selectedRating,
                 }),
             });
             const payload = await response.json() as { error?: string };
-            if (!response.ok) throw new Error(payload.error || "Không thể lưu kết quả ôn tập.");
-
-            const refresh = await fetch(`/api/flashcards?language=${language}`, { cache: "no-store" });
-            const studyData = await refresh.json() as StudyData & { error?: string };
-            if (!refresh.ok) throw new Error(studyData.error || "Không thể tải thẻ tiếp theo.");
-            setSession({ ...studyData, language });
-            setRevealed(false);
+            if (!response.ok) throw new Error(payload.error || "Could not save your review.");
+            await refreshSession(false);
         } catch (error) {
-            messageApi.error(error instanceof Error ? error.message : "Không thể lưu kết quả ôn tập.");
+            messageApi.error(error instanceof Error ? error.message : "Could not save your review.");
         } finally {
             setRating(null);
         }
@@ -126,134 +173,222 @@ const FlashcardsPage = () => {
     const switchLanguage = (value: string | number) => {
         setLoadError("");
         setLanguage(value as Language);
-        setLoading(true);
+        setRevealed(false);
     };
 
     return (
-        <main style={{ maxWidth: 1050, margin: "0 auto", padding: "28px clamp(16px, 3vw, 36px) 48px" }}>
+        <main className={`mx-auto w-full max-w-6xl px-4 sm:px-6 lg:px-8 ${isStudying ? "flex min-h-full flex-col py-3" : "py-6 pb-10"} ${isStudying && revealed ? "pb-32" : ""}`}>
             {contextHolder}
-            <Space align="start" size={12} style={{ marginBottom: 24 }}>
-                <BookOutlined style={{ color: "#1677ff", fontSize: 24, marginTop: 4 }} />
+            <header className={`flex flex-shrink-0 ${isStudying ? "mb-2 items-center gap-2" : "mb-6 items-start gap-3"}`}>
+                <span className={`flex flex-shrink-0 items-center justify-center rounded-lg bg-indigo-100 text-indigo-600 ${isStudying ? "h-8 w-8" : "mt-1 h-10 w-10 rounded-xl"}`}>
+                    <BookOutlined style={{ fontSize: isStudying ? 15 : 18 }} />
+                </span>
                 <div>
-                    <Typography.Title level={3} style={{ margin: 0 }}>Flashcards</Typography.Title>
-                    <Typography.Text type="secondary">Ôn từ vựng theo lịch lặp lại ngắt quãng.</Typography.Text>
+                    <Typography.Title level={isStudying ? 4 : 3} style={{ margin: 0, color: "#211F38" }}>Flashcards</Typography.Title>
+                    {!isStudying && <Typography.Text type="secondary">Review vocabulary and notes from your mindmaps.</Typography.Text>}
                 </div>
-            </Space>
+            </header>
 
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 16, flexWrap: "wrap", marginBottom: 20 }}>
+            <section className={`flex flex-shrink-0 flex-wrap items-center justify-between border border-slate-200/80 bg-white shadow-sm ${isStudying ? "mb-2 gap-2 rounded-lg p-2" : "mb-5 gap-3 rounded-xl p-3"}`}>
                 <Segmented
-                    value={language}
-                    onChange={switchLanguage}
-                    options={[{ label: "Tiếng Anh", value: "en" }, { label: "Tiếng Nhật", value: "ja" }]}
+                    size={isStudying ? "small" : "middle"}
+                    value={deckType}
+                    onChange={(value) => {
+                        setLoadError("");
+                        setDeckType(value as DeckType);
+                        setSelectedNotebookId(null);
+                        setRevealed(false);
+                    }}
+                    options={[{ label: "Vocabulary", value: "vocabulary" }, { label: "Mindmap", value: "mindmap" }]}
                 />
                 <Space wrap>
-                    <Typography.Text type="secondary">
-                        {activeSession ? `${activeSession.dueCount} đến hạn · ${activeSession.newCount} thẻ mới · ${activeSession.total} từ` : "Đang tải bộ thẻ"}
+                    <Typography.Text type="secondary" className="text-xs">
+                        {activeSession ? `${activeSession.dueCount} due · ${activeSession.newCount} new · ${activeSession.total} cards` : "Loading deck"}
                     </Typography.Text>
-                    <Button href={`/api/flashcards?language=${language}`} icon={<ReloadOutlined />} onClick={(event) => {
-                        event.preventDefault();
-                        setLoading(true);
-                        fetch(`/api/flashcards?language=${language}`, { cache: "no-store" })
-                            .then(async (response) => {
-                                const payload = await response.json() as StudyData & { error?: string };
-                                if (!response.ok) throw new Error(payload.error || "Không thể làm mới thẻ.");
-                                setSession({ ...payload, language });
-                                setRevealed(false);
-                            })
-                            .catch((error: unknown) => messageApi.error(error instanceof Error ? error.message : "Không thể làm mới thẻ."))
-                            .finally(() => setLoading(false));
-                    }}>
-                        Làm mới
-                    </Button>
-                    <Button type="link" href="/vocabulary" icon={<SwapOutlined />}>Sổ từ vựng</Button>
+                    <Button size={isStudying ? "small" : "middle"} icon={<ReloadOutlined />} onClick={() => void refreshSession()}>Refresh</Button>
+                    {deckType === "vocabulary" && <Button size={isStudying ? "small" : "middle"} type="link" href="/vocabulary" icon={<SwapOutlined />}>Vocabulary list</Button>}
                 </Space>
-            </div>
+            </section>
+
+            {deckType === "vocabulary" ? (
+                <div className={`flex flex-shrink-0 flex-wrap items-center gap-2 ${isStudying ? "mb-2" : "mb-5 gap-3"}`}>
+                    <span className="text-xs font-medium text-slate-500">Language</span>
+                    <Segmented
+                        size={isStudying ? "small" : "middle"}
+                        value={language}
+                        onChange={switchLanguage}
+                        options={[{ label: "English", value: "en" }, { label: "Japanese", value: "ja" }]}
+                    />
+                </div>
+            ) : availableNotebooks.length > 0 ? (
+                <nav aria-label="Filter by notebook" className={`flex flex-shrink-0 gap-2 overflow-x-auto ${isStudying ? "mb-2" : "mb-6 pb-2"}`}>
+                    <button
+                        type="button"
+                        aria-pressed={selectedNotebookId === null}
+                        onClick={() => { setSelectedNotebookId(null); setRevealed(false); }}
+                        className={`flex-shrink-0 rounded-full border px-3 py-1 text-xs font-semibold transition-colors ${selectedNotebookId === null ? "border-indigo-600 bg-indigo-600 text-white" : "border-slate-200 bg-white text-slate-600 hover:border-indigo-300 hover:text-indigo-700"}`}
+                    >
+                        All notebooks
+                    </button>
+                    {availableNotebooks.map((notebook) => (
+                        <button
+                            key={notebook.id}
+                            type="button"
+                            aria-pressed={selectedNotebookId === notebook.id}
+                            onClick={() => { setSelectedNotebookId(notebook.id); setRevealed(false); }}
+                            className={`flex-shrink-0 rounded-full border px-3 py-1 text-xs font-semibold transition-colors ${selectedNotebookId === notebook.id ? "border-indigo-600 bg-indigo-600 text-white" : "border-slate-200 bg-white text-slate-600 hover:border-indigo-300 hover:text-indigo-700"}`}
+                        >
+                            {notebook.title || "Untitled notebook"} <span className="ml-1 opacity-70">{notebook.total}</span>
+                        </button>
+                    ))}
+                </nav>
+            ) : null}
 
             {activeSession && activeSession.total > 0 && (
-                <Progress percent={progress} showInfo={false} size="small" style={{ marginBottom: 22 }} />
+                <div className={`flex-shrink-0 ${isStudying ? "mb-2" : "mb-7"}`}>
+                    <div className="mb-1 flex justify-between text-[11px] font-medium text-slate-500">
+                        <span>Study progress</span>
+                        <span>{progress}%</span>
+                    </div>
+                    <Progress percent={progress} showInfo={false} size="small" />
+                </div>
             )}
 
             {loading ? (
-                <div style={{ minHeight: 360, display: "grid", placeItems: "center" }}><Spin size="large" /></div>
+                <div className="grid min-h-[420px] place-items-center"><Spin size="large" /></div>
             ) : loadError ? (
                 <Alert
                     type="error"
                     showIcon
                     message={loadError}
-                    action={<Button size="small" icon={<ReloadOutlined />} onClick={() => {
-                        setLoadError("");
-                        setLoading(true);
-                        fetch(`/api/flashcards?language=${language}`, { cache: "no-store" })
-                            .then(async (response) => {
-                                const payload = await response.json() as StudyData & { error?: string };
-                                if (!response.ok) throw new Error(payload.error || "Không thể tải thẻ ôn tập.");
-                                setSession({ ...payload, language });
-                                setRevealed(false);
-                            })
-                            .catch((error: unknown) => setLoadError(error instanceof Error ? error.message : "Không thể tải thẻ ôn tập."))
-                            .finally(() => setLoading(false));
-                    }}>Thử lại</Button>}
+                    action={<Button size="small" icon={<ReloadOutlined />} onClick={() => void refreshSession()}>Try again</Button>}
                 />
             ) : !activeSession ? (
-                <div style={{ minHeight: 360, display: "grid", placeItems: "center" }}><Spin size="large" /></div>
+                <div className="grid min-h-[420px] place-items-center"><Spin size="large" /></div>
             ) : !currentCard ? (
-                <Empty
-                    image={Empty.PRESENTED_IMAGE_SIMPLE}
-                    description={activeSession.total === 0 ? "Sổ từ vựng chưa có thẻ. Hãy thêm từ trong mục Vocabulary." : "Đã ôn hết các thẻ đang đến hạn. Hẹn gặp lại ở lượt ôn tiếp theo."}
-                >
-                    {activeSession.total === 0 && <Button type="primary" href="/vocabulary">Mở sổ từ vựng</Button>}
-                </Empty>
+                <div className="rounded-3xl border border-slate-200 bg-white px-5 py-12 shadow-sm">
+                    <Empty
+                        image={Empty.PRESENTED_IMAGE_SIMPLE}
+                        description={activeSession.total === 0
+                            ? deckType === "mindmap"
+                                ? "No mindmap flashcards yet. Create one from a node's context menu."
+                                : "Your vocabulary deck is empty. Add words in Vocabulary."
+                            : "No cards are due right now. Come back later for your next review."}
+                    >
+                        {activeSession.total === 0 && deckType === "vocabulary" && <Button type="primary" href="/vocabulary">Open vocabulary list</Button>}
+                    </Empty>
+                </div>
             ) : (
                 <>
-                    <div style={{ textAlign: "center", marginBottom: 12 }}>
-                        <Tag color={currentCard.state ? "processing" : "blue"}>{currentCard.state ? "ĐẾN HẠN" : "THẺ MỚI"}</Tag>
-                        <Typography.Text type="secondary" style={{ marginLeft: 8 }}>
-                            {activeSession.cards.length} thẻ trong lượt này
+                    <div className="mb-1.5 flex flex-shrink-0 flex-wrap items-center justify-center gap-1">
+                        <Tag className="m-0 text-[10px] leading-5" color={currentCard.state ? "processing" : "blue"}>{currentCard.state ? "DUE" : "NEW"}</Tag>
+                        <Tag className="m-0 text-[10px] leading-5" color={currentCard.type === "mindmap" ? "purple" : "default"}>
+                            {currentCard.type === "mindmap" ? currentCard.entry.notebookTitle || "MINDMAP" : "VOCABULARY"}
+                        </Tag>
+                        <Typography.Text type="secondary" className="text-xs">
+                            {activeSession.cards.length} cards in this session
                         </Typography.Text>
                     </div>
 
                     <Card
-                        style={{ maxWidth: 720, minHeight: 360, margin: "0 auto", borderRadius: 8 }}
-                        styles={{ body: { minHeight: 310, display: "flex", flexDirection: "column", justifyContent: "center", padding: "32px clamp(20px, 5vw, 56px)" } }}
+                        className="mx-auto w-full max-w-2xl self-center overflow-hidden rounded-xl border-slate-200 shadow-[0_12px_36px_-28px_rgba(47,42,91,0.35)]"
+                        styles={{ body: { padding: 0 } }}
                     >
-                        <div style={{ textAlign: "center" }}>
-                            <Typography.Title level={1} style={{ margin: "0 0 8px", overflowWrap: "anywhere" }}>
-                                {currentCard.entry.word}
-                            </Typography.Title>
-                            {currentCard.entry.phonetic && (
-                                <Typography.Text type="secondary" style={{ fontSize: 16 }}>{currentCard.entry.phonetic}</Typography.Text>
-                            )}
-                            {currentCard.entry.partOfSpeech && (
-                                <div style={{ marginTop: 12 }}><Tag>{currentCard.entry.partOfSpeech}</Tag></div>
-                            )}
+                        <div className="flex flex-shrink-0 flex-wrap items-center justify-between gap-1 border-b border-indigo-100 bg-gradient-to-r from-indigo-50 via-white to-sky-50 px-4 py-2 sm:px-5">
+                            <span className="text-[9px] font-bold uppercase tracking-[0.14em] text-indigo-600">
+                                {currentCard.type === "mindmap" ? "Mindmap · Front" : "Vocabulary · Front"}
+                            </span>
+                            <span className="text-[10px] font-medium text-slate-400">{revealed ? "Back" : "Try to recall before revealing"}</span>
                         </div>
 
-                        {revealed && (
-                            <div style={{ borderTop: "1px solid #f0f0f0", marginTop: 28, paddingTop: 22 }}>
-                                <Typography.Title level={4} style={{ marginTop: 0 }}>{currentCard.entry.meaning}</Typography.Title>
-                                {currentCard.entry.description && <Typography.Paragraph>{currentCard.entry.description}</Typography.Paragraph>}
-                                {currentCard.entry.examples?.filter((example) => example.sentence || example.translation).map((example, index) => (
-                                    <div key={`${currentCard.entry.id}-${index}`} style={{ marginTop: 12 }}>
-                                        <Typography.Text>{example.sentence}</Typography.Text>
-                                        {example.translation && <div><Typography.Text type="secondary">{example.translation}</Typography.Text></div>}
+                        <div className="px-4 py-5 sm:px-6 sm:py-6 lg:px-8">
+                            {currentCard.type === "mindmap" ? (
+                                <>
+                                    <div className="mx-auto max-w-xl text-center">
+                                        {currentCard.entry.context && (
+                                            <div className="mb-3 inline-flex max-w-full rounded-lg border border-indigo-100 bg-indigo-50 px-3 py-1.5 text-xs font-medium text-indigo-700">
+                                                <span className="break-words [overflow-wrap:anywhere]">{currentCard.entry.context}</span>
+                                            </div>
+                                        )}
+                                        <h2 className="whitespace-pre-wrap break-words text-2xl font-bold leading-tight tracking-tight text-[#25233A] [overflow-wrap:anywhere] sm:text-3xl">
+                                            {currentCard.entry.front}
+                                        </h2>
                                     </div>
-                                ))}
-                                {currentCard.state && (
-                                    <Typography.Text type="secondary" style={{ display: "block", marginTop: 16 }}>
-                                        Khoảng ôn hiện tại: {currentCard.state.intervalDays} ngày · độ dễ {currentCard.state.easeFactor.toFixed(2)}
-                                    </Typography.Text>
-                                )}
-                            </div>
-                        )}
+                                    {revealed && (
+                                        <section className="mx-auto mt-4 max-w-xl rounded-lg border border-emerald-100 bg-emerald-50/60 p-3 sm:p-4">
+                                            <p className="mb-2 text-[10px] font-bold uppercase tracking-[0.14em] text-emerald-700">Direct child ideas</p>
+                                            <ul className="space-y-2">
+                                                {currentCard.entry.children.map((child, index) => (
+                                                    <li key={`${currentCard.entry.id}-${index}`} className="flex gap-2 text-xs leading-relaxed text-slate-800 sm:text-sm">
+                                                        <span className="mt-2 h-2 w-2 flex-shrink-0 rounded-full bg-emerald-500" />
+                                                        <span className="whitespace-pre-wrap break-words">{child}</span>
+                                                    </li>
+                                                ))}
+                                            </ul>
+                                        </section>
+                                    )}
+                                </>
+                            ) : (
+                                <>
+                                    <div className="mx-auto max-w-xl text-center">
+                                        {currentCard.entry.partOfSpeech && (
+                                            <Tag className="mb-2 rounded-full px-2 py-0 text-[10px]">{currentCard.entry.partOfSpeech}</Tag>
+                                        )}
+                                        <h2 className="break-words text-3xl font-bold leading-tight tracking-tight text-[#25233A] [overflow-wrap:anywhere] sm:text-4xl">
+                                            {currentCard.entry.word}
+                                        </h2>
+                                        {currentCard.entry.phonetic && (
+                                            <p className="mt-1 text-xs font-medium tracking-wide text-slate-500">{currentCard.entry.phonetic}</p>
+                                        )}
+                                    </div>
+
+                                    {revealed && (
+                                        <div className="mx-auto mt-4 max-w-xl space-y-2">
+                                            <section className="rounded-lg border border-indigo-100 bg-indigo-50/80 p-3 sm:p-4">
+                                                <p className="mb-1 text-[10px] font-bold uppercase tracking-[0.14em] text-indigo-600">Main meaning</p>
+                                                <p className="text-sm font-semibold leading-relaxed text-[#292741] sm:text-base">{currentCard.entry.meaning}</p>
+                                            </section>
+
+                                            {currentCard.entry.examples?.filter((example) => example.sentence || example.translation).length > 0 && (
+                                                <section className="rounded-lg border border-slate-200 bg-white p-3 sm:p-4">
+                                                    <p className="mb-2 text-[10px] font-bold uppercase tracking-[0.14em] text-slate-500">Examples</p>
+                                                    <div className="space-y-2">
+                                                        {currentCard.entry.examples.filter((example) => example.sentence || example.translation).map((example, index) => (
+                                                            <div key={`${currentCard.entry.id}-${index}`} className="border-l-2 border-sky-200 pl-2.5">
+                                                                {example.sentence && <p className="text-xs font-medium leading-relaxed text-slate-800 sm:text-sm">{example.sentence}</p>}
+                                                                {example.translation && <p className="mt-1 text-xs leading-relaxed text-slate-500">{example.translation}</p>}
+                                                            </div>
+                                                        ))}
+                                                    </div>
+                                                </section>
+                                            )}
+
+                                            {currentCard.entry.description && (
+                                                <section className="rounded-md bg-slate-50 px-3 py-2">
+                                                    <p className="mb-1 text-[10px] font-bold uppercase tracking-[0.12em] text-slate-400">Notes</p>
+                                                    <p className="text-xs leading-relaxed text-slate-600">{currentCard.entry.description}</p>
+                                                </section>
+                                            )}
+                                        </div>
+                                    )}
+                                </>
+                            )}
+
+                            {currentCard.state && (
+                                <p className="mt-3 text-center text-[10px] text-slate-400">
+                                    Current interval: {currentCard.state.intervalDays} days · ease {currentCard.state.easeFactor.toFixed(2)}
+                                </p>
+                            )}
+                        </div>
                     </Card>
 
-                    <div style={{ maxWidth: 720, margin: "20px auto 0", textAlign: "center" }}>
+                    <div className={`mx-auto mt-2 flex w-full max-w-2xl flex-shrink-0 justify-center self-center ${revealed ? "fixed inset-y-auto right-3 bottom-0 left-[92px] z-50 mt-0 max-w-none border-t border-slate-200 bg-white/95 px-4 pt-3 pb-[calc(env(safe-area-inset-bottom)+0.75rem)] shadow-[0_-8px_24px_rgba(15,23,42,0.12)] backdrop-blur max-[991px]:right-2 max-[991px]:left-[80px] max-[575px]:left-0" : ""}`}>
                         {!revealed ? (
-                            <Button type="primary" size="large" onClick={() => setRevealed(true)} style={{ minWidth: 180 }}>
-                                Lật thẻ
+                            <Button size="small" type="primary" onClick={() => setRevealed(true)} className="h-8 w-full max-w-44 rounded-md text-xs font-medium shadow-sm shadow-indigo-200">
+                                Reveal answer
                             </Button>
                         ) : (
-                            <Space wrap size={[8, 12]} style={{ justifyContent: "center" }}>
+                            <div className="mx-auto grid w-full max-w-2xl grid-cols-2 gap-2 sm:grid-cols-4">
                                 {ratingOptions.map((option) => (
                                     <Button
                                         key={option.value}
@@ -263,19 +398,23 @@ const FlashcardsPage = () => {
                                         loading={rating === option.value}
                                         disabled={rating !== null}
                                         onClick={() => void submitRating(option.value)}
-                                        style={{ minWidth: 104, height: 54 }}
+                                        size="small"
+                                        className="!flex h-auto min-h-11 w-full min-w-0 items-center justify-center whitespace-normal rounded-md px-2 py-1.5 text-xs"
                                     >
-                                        <span>{option.label}<br /><Typography.Text type="secondary" style={{ fontSize: 11 }}>{option.description}</Typography.Text></span>
+                                        <span className="block min-w-0 max-w-full break-words text-center leading-tight">
+                                            <span className="block font-semibold">{option.label}</span>
+                                            <span className="mt-0.5 block text-[10px] text-slate-500">in {getRepeatTime(currentCard.state, option.value)}</span>
+                                        </span>
                                     </Button>
                                 ))}
-                            </Space>
+                            </div>
                         )}
                     </div>
                 </>
             )}
 
             {activeSession && activeSession.total > 0 && activeSession.newCount === 0 && activeSession.dueCount === 0 && (
-                <Alert type="success" showIcon style={{ maxWidth: 720, margin: "28px auto 0" }} message="Bạn đã hoàn thành lượt ôn hôm nay." />
+                <Alert type="success" showIcon className="mx-auto mt-7 max-w-3xl rounded-xl" message="You have completed today's review." />
             )}
         </main>
     );

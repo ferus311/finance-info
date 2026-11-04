@@ -1,87 +1,74 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState, memo } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+    App as AntApp, Button, Card, Col, ConfigProvider, Drawer, Flex, Input, InputNumber, List, Popover,
+    Progress, Row, Segmented, Select, Slider, Spin, Switch, Tabs, Typography, theme,
+} from "antd";
+import {
+    DeleteOutlined, MenuOutlined, MoonOutlined, PauseCircleFilled, PlayCircleFilled, ReloadOutlined,
+    SettingOutlined, StepBackwardOutlined, StepForwardOutlined, SunOutlined,
+} from "@ant-design/icons";
 
-// ==========================================
-// TYPES & GLOBALS
-// ==========================================
+const { Text } = Typography;
+
 type Block = { id: string; text: string; start: number; end: number };
-type SavedVideo = { id: string; url: string; title: string; thumbnail: string; addedAt: number };
+type Video = { id: string; title: string; thumbnail: string };
+type Mode = "off" | "loop" | "next" | "shadow";
 
 declare global {
-    interface Window {
-        YT?: any;
-        onYouTubeIframeAPIReady?: () => void;
-    }
+    interface Window { YT?: any; onYouTubeIframeAPIReady?: () => void }
 }
 
 // ==========================================
-// CONSTANTS & CONFIG
+// CONSTANTS & HELPERS
 // ==========================================
-const CUTOFF_COMPENSATION_SEC = 0.15;
-const POLL_INTERVAL_MS = 50;
-const MATCH_THRESHOLD_PERCENT = 70;
-const DEFAULT_MIN_DURATION = 7;
-const DEFAULT_MAX_DURATION = 20;
+const CUTOFF = 0.1; // dừng sớm một chút để bù độ trễ của lệnh pause
+const POLL_MS = 40;
+const PASS_PERCENT = 70;
+const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5];
+const LANGS = [
+    ["ja", "日本語"], ["en", "English"], ["vi", "Tiếng Việt"], ["ko", "한국어"],
+    ["zh", "中文"], ["de", "Deutsch"], ["fr", "Français"], ["es", "Español"],
+].map(([value, label]) => ({ value, label }));
+const MODE_HINT: Record<Mode, string> = {
+    off: "Phát hết block rồi dừng.",
+    loop: "Lặp lại block hiện tại.",
+    next: "Tự chuyển sang block kế tiếp.",
+    shadow: "Dừng một khoảng bằng độ dài block để bạn đọc theo (shadowing), rồi chuyển block.",
+};
+const CSS = `.blur-text{filter:blur(8px);user-select:none;transition:filter .2s}`;
 
-const SUPPORTED_LANGUAGES = [
-    { code: "ja", label: "Japanese (日本語)" },
-    { code: "en", label: "English" },
-    { code: "vi", label: "Vietnamese (Tiếng Việt)" },
-    { code: "ko", label: "Korean (한국어)" },
-    { code: "zh", label: "Chinese (中文)" },
-    { code: "de", label: "German (Deutsch)" },
-    { code: "fr", label: "French (Français)" },
-    { code: "es", label: "Spanish (Español)" },
-];
+const thumb = (id: string) => `https://img.youtube.com/vi/${id}/hqdefault.jpg`;
+const videoIdOf = (u: string) => u.match(/(?:youtube\.com\/(?:watch\?(?:.*&)?v=|embed\/|shorts\/)|youtu\.be\/)([\w-]{11})/i)?.[1] ?? null;
+const playlistIdOf = (u: string) => u.match(/[?&]list=([\w-]+)/)?.[1] ?? null;
 
-const PLAYBACK_SPEEDS = [0.5, 0.75, 1, 1.25, 1.5];
+const store = {
+    get<T>(key: string, fallback: T): T {
+        try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : fallback; } catch { return fallback; }
+    },
+    set(key: string, value: unknown) { try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* ignore */ } },
+};
 
-// ==========================================
-// HELPERS
-// ==========================================
-function getYouTubeVideoId(url: string) {
-    return url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/|youtube\.com\/shorts\/)([\w-]{11})/i)?.[1] ?? null;
-}
-
-function getYouTubePlaylistId(url: string) {
-    return url.match(/[?&]list=([^#\&\?]+)/)?.[1] ?? null;
-}
-
-async function fetchYouTubeMetadata(url: string) {
+async function fetchTitle(url: string) {
     try {
-        const res = await fetch(`https://noembed.com/embed?url=${encodeURIComponent(url)}`);
-        const data = await res.json();
-        return {
-            title: data.title || "Unknown Title",
-            thumbnail: data.thumbnail_url || `https://img.youtube.com/vi/${getYouTubeVideoId(url)}/hqdefault.jpg`,
-        };
-    } catch {
-        return {
-            title: "Unknown Title",
-            thumbnail: `https://img.youtube.com/vi/${getYouTubeVideoId(url)}/hqdefault.jpg`,
-        };
-    }
+        return (await (await fetch(`https://noembed.com/embed?url=${encodeURIComponent(url)}`)).json()).title || "Untitled";
+    } catch { return "Untitled"; }
 }
 
-function buildFallbackBlocks(duration: number, blockSeconds: number): Block[] {
-    const safeDuration = Number.isFinite(duration) && duration > 0 ? duration : 180;
-    const count = Math.max(1, Math.ceil(safeDuration / blockSeconds));
-    return Array.from({ length: count }, (_, i) => {
-        const start = (safeDuration / count) * i;
-        const end = Math.min(safeDuration, (safeDuration / count) * (i + 1));
-        return {
-            id: `auto-${i}`,
-            text: `[No captions available] Listen to block ${i + 1}`,
-            start: Number(start.toFixed(2)),
-            end: Number(end.toFixed(2)),
-        };
-    });
+function fallbackBlocks(duration: number, sec: number): Block[] {
+    const count = Math.max(1, Math.ceil(duration / sec));
+    return Array.from({ length: count }, (_, i) => ({
+        id: `auto-${i}`,
+        text: `[Không có phụ đề] Nghe đoạn ${i + 1}`,
+        start: Number(((duration / count) * i).toFixed(2)),
+        end: Number(((duration / count) * (i + 1)).toFixed(2)),
+    }));
 }
 
 function loadYouTubeApi(): Promise<void> {
     return new Promise((resolve) => {
-        if (window.YT && window.YT.Player) return resolve();
+        if (window.YT?.Player) return resolve();
         const prev = window.onYouTubeIframeAPIReady;
         window.onYouTubeIframeAPIReady = () => { prev?.(); resolve(); };
         if (!document.querySelector('script[src="https://www.youtube.com/iframe_api"]')) {
@@ -92,515 +79,437 @@ function loadYouTubeApi(): Promise<void> {
     });
 }
 
-function normalizeForCompare(text: string) {
-    return text.replace(/[\s。、！？.,!?"'“”‘’（）()]/g, "").toLowerCase();
-}
-
-function levenshteinDistance(a: string, b: string): number {
-    const dp: number[][] = Array.from({ length: a.length + 1 }, () => new Array(b.length + 1).fill(0));
-    for (let i = 0; i <= a.length; i++) dp[i][0] = i;
-    for (let j = 0; j <= b.length; j++) dp[0][j] = j;
-    for (let i = 1; i <= a.length; i++) {
-        for (let j = 1; j <= b.length; j++) {
-            dp[i][j] = Math.min(
-                dp[i - 1][j] + 1,
-                dp[i][j - 1] + 1,
-                dp[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)
-            );
+const norm = (s: string) => s.normalize("NFKC").replace(/[\s\p{P}\p{S}]/gu, "").toLowerCase();
+function similarity(typed: string, expected: string): number {
+    const x = [...norm(typed)], y = [...norm(expected)];
+    if (!x.length && !y.length) return 100;
+    let prev = Array.from({ length: y.length + 1 }, (_, j) => j);
+    for (let i = 1; i <= x.length; i++) {
+        const cur = [i];
+        for (let j = 1; j <= y.length; j++) {
+            cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (x[i - 1] === y[j - 1] ? 0 : 1));
         }
+        prev = cur;
     }
-    return dp[a.length][b.length];
-}
-
-function similarityPercent(typed: string, expected: string): number {
-    const a = normalizeForCompare(typed);
-    const b = normalizeForCompare(expected);
-    if (!a.length && !b.length) return 100;
-    const maxLen = Math.max(a.length, b.length) || 1;
-    return Math.max(0, Math.round((1 - levenshteinDistance(a, b) / maxLen) * 100));
-}
-
-function decodeHTMLEntities(text: string) {
-    if (typeof document === "undefined") return text;
-    const textArea = document.createElement("textarea");
-    textArea.innerHTML = text;
-    return textArea.value;
+    return Math.max(0, Math.round((1 - prev[y.length] / Math.max(x.length, y.length)) * 100));
 }
 
 // ==========================================
-// COMPONENT: DictationBox
+// DICTATION BOX
 // ==========================================
-const DictationBox = memo(function DictationBox({ expectedText }: { expectedText: string }) {
+const Dictation = memo(function Dictation({ id, expected, onPass }: { id: string; expected: string; onPass: (id: string) => void }) {
     const [draft, setDraft] = useState("");
-    const similarity = useMemo(() => draft.trim() ? similarityPercent(draft, expectedText) : 0, [draft, expectedText]);
-    const isMatch = similarity >= MATCH_THRESHOLD_PERCENT;
+    const sim = useMemo(() => (draft.trim() ? similarity(draft, expected) : 0), [draft, expected]);
+    const ok = sim >= PASS_PERCENT;
+    useEffect(() => { if (ok) onPass(id); }, [ok, id, onPass]);
 
     return (
-        <div className="flex flex-col gap-2 relative z-0">
-            <textarea
+        <Flex vertical gap={8}>
+            <Input.TextArea
                 value={draft}
                 onChange={(e) => setDraft(e.target.value)}
-                className="h-28 sm:h-32 bg-slate-900 border border-slate-700 rounded-xl p-4 text-base outline-none focus:border-cyan-400 w-full resize-none text-slate-100 shadow-inner"
-                placeholder="Type what you hear here... (Listen carefully!)"
+                autoSize={{ minRows: 3, maxRows: 6 }}
+                placeholder="Gõ những gì bạn nghe được..."
+                spellCheck={false}
+                style={{ fontSize: 16 }}
             />
             {draft.trim() && (
-                <div className={`flex items-center justify-between text-sm px-1 font-medium ${isMatch ? "text-emerald-400" : "text-amber-400"}`}>
-                    <span>Match: {similarity}%</span>
-                    <span>{isMatch ? "✓ Excellent!" : `Keep trying (Need ${MATCH_THRESHOLD_PERCENT}%)`}</span>
-                </div>
+                <Flex align="center" gap={12}>
+                    <Progress percent={sim} size="small" status={ok ? "success" : "active"} style={{ flex: 1, margin: 0 }} />
+                    <Text type={ok ? "success" : "warning"}>{ok ? "Chuẩn!" : `Cần ${PASS_PERCENT}%`}</Text>
+                </Flex>
             )}
-        </div>
+        </Flex>
     );
 });
 
 // ==========================================
-// MAIN APP COMPONENT
+// ROOT: theme provider
 // ==========================================
-export default function Home() {
-    const [isSidebarOpen, setIsSidebarOpen] = useState(false);
-    const [showSettings, setShowSettings] = useState(false);
-    const [addMode, setAddMode] = useState<"video" | "playlist">("video");
-
-    const [sourceUrl, setSourceUrl] = useState("https://www.youtube.com/watch?v=2g5uQ_JaCYE");
-    const [language, setLanguage] = useState("ja");
-    const [minDuration, setMinDuration] = useState(DEFAULT_MIN_DURATION);
-    const [maxDuration, setMaxDuration] = useState(DEFAULT_MAX_DURATION);
-
-    const [library, setLibrary] = useState<SavedVideo[]>([]);
-    const [newInputUrl, setNewInputUrl] = useState("");
-    const [isAddingPlaylist, setIsAddingPlaylist] = useState(false);
-
-    const [blocks, setBlocks] = useState<Block[]>([]);
-    const [currentIndex, setCurrentIndex] = useState(0);
-    const [isBlind, setIsBlind] = useState(false);
-
-    const [autoNext, setAutoNext] = useState(false);
-    const [loopCurrent, setLoopCurrent] = useState(false);
-    const [playbackRate, setPlaybackRate] = useState(1);
-
-    const [status, setStatus] = useState<"idle" | "loading" | "success" | "error">("idle");
-    const [message, setMessage] = useState("");
-    const [isPlayingBlock, setIsPlayingBlock] = useState(false);
-
-    const playerRef = useRef<any>(null);
-    const currentBlock = blocks[currentIndex] ?? null;
-
-    useEffect(() => {
-        const saved = localStorage.getItem("shadowing_library");
-        if (saved) setLibrary(JSON.parse(saved));
-        const lastUrl = localStorage.getItem("shadowing_last_url");
-        if (lastUrl) setSourceUrl(lastUrl);
-    }, []);
-
-    const updateLibrary = (newLib: SavedVideo[]) => {
-        setLibrary(newLib);
-        localStorage.setItem("shadowing_library", JSON.stringify(newLib));
-    };
-
-    // --- HANDLE ADDING VIDEO OR PLAYLIST ---
-    const handleAddSubmit = async (e: React.FormEvent) => {
-        e.preventDefault();
-
-        if (addMode === "video") {
-            const vidId = getYouTubeVideoId(newInputUrl);
-            if (!vidId) return alert("Invalid YouTube Video URL");
-            if (library.some(v => v.id === vidId)) return alert("Video already in library");
-
-            const meta = await fetchYouTubeMetadata(newInputUrl);
-            updateLibrary([{ id: vidId, url: newInputUrl, title: meta.title, thumbnail: meta.thumbnail, addedAt: Date.now() }, ...library]);
-            setNewInputUrl("");
-
-        } else {
-            // PLAYLIST LOGIC
-            const playlistId = getYouTubePlaylistId(newInputUrl);
-            if (!playlistId) return alert("Invalid YouTube Playlist URL");
-
-            setIsAddingPlaylist(true);
-            try {
-                // Kiến trúc chuẩn: Gọi backend API route của Next.js (bạn cần tự tạo file app/api/playlist/route.ts)
-                // const res = await fetch(`/api/playlist?id=${playlistId}`);
-                // const videos = await res.json();
-
-                // VÌ HIỆN TẠI CHƯA CÓ BACKEND, TÔI DÙNG MOCK LOGIC: Add 1 video nếu nó nằm trong link playlist.
-                console.warn("Backend /api/playlist chưa khả dụng. Bóc tách fallback video id từ URL...");
-                const vidId = getYouTubeVideoId(newInputUrl);
-
-                if (vidId) {
-                    const meta = await fetchYouTubeMetadata(newInputUrl);
-                    if (!library.some(v => v.id === vidId)) {
-                        updateLibrary([{ id: vidId, url: `https://youtube.com/watch?v=${vidId}`, title: meta.title, thumbnail: meta.thumbnail, addedAt: Date.now() }, ...library]);
-                        alert(`Vì chưa có Backend gọi YouTube API, tôi tạm lấy Video đang phát: ${meta.title}`);
-                    }
-                } else {
-                    alert("Cần Backend để fetch toàn bộ Playlist. Vui lòng tạo endpoint /api/playlist.");
-                }
-            } catch (err) {
-                alert("Lỗi khi lấy dữ liệu Playlist.");
-            } finally {
-                setIsAddingPlaylist(false);
-                setNewInputUrl("");
-            }
-        }
-    };
-
-    const removeVideo = (id: string, e: React.MouseEvent) => {
-        e.stopPropagation();
-        updateLibrary(library.filter(v => v.id !== id));
-    };
-
-    // Auto-load feature: Khi bấm vào list là fetch luôn
-    const loadFromLibrary = (url: string) => {
-        setSourceUrl(url);
-        handleFetch(url); // Truyền trực tiếp URL vào thay vì đợi state update
-    };
-
-    // ==========================================
-    // Core Logic (Đã refactor để nhận targetUrl)
-    // ==========================================
-    const handleFetch = async (targetUrl?: string) => {
-        // Fix event type if called directly from onClick
-        const urlToProcess = typeof targetUrl === 'string' ? targetUrl : sourceUrl;
-
-        const videoId = getYouTubeVideoId(urlToProcess);
-        if (!videoId) return setMessage("Invalid YouTube URL.");
-
-        localStorage.setItem("shadowing_last_url", urlToProcess);
-        setStatus("loading");
-        setMessage("Analyzing sentence structure and timestamps...");
-
-        await loadYouTubeApi();
-        if (!playerRef.current) {
-            playerRef.current = new window.YT.Player("youtube-player", {
-                videoId,
-                width: "100%",
-                height: "100%",
-                playerVars: { autoplay: 1, controls: 1, rel: 0, playsinline: 1 },
-                events: {
-                    onStateChange: (e: any) => {
-                        if (!window.YT) return;
-                        if (e.data === window.YT.PlayerState.PLAYING) setIsPlayingBlock(true);
-                        else if (e.data === window.YT.PlayerState.PAUSED || e.data === window.YT.PlayerState.ENDED) setIsPlayingBlock(false);
-                    },
-                    onReady: (e: any) => e.target.setPlaybackRate(playbackRate)
-                },
-            });
-        } else {
-            playerRef.current.loadVideoById(videoId);
-            setTimeout(() => playerRef.current.setPlaybackRate(playbackRate), 500);
-        }
-
-        try {
-            const params = new URLSearchParams({
-                videoId,
-                lang: language,
-                minDuration: String(minDuration),
-                maxDuration: String(maxDuration),
-            });
-            const res = await fetch(`/api/transcript?${params.toString()}`);
-            const data = await res.json();
-            if (!data.success || data.data.length === 0) throw new Error(data.error || "No_Data");
-
-            const cleanedBlocks = data.data.map((b: Block) => ({
-                ...b,
-                text: decodeHTMLEntities(b.text)
-            }));
-
-            setBlocks(cleanedBlocks);
-            setStatus("success");
-            setMessage(`Extracted ${cleanedBlocks.length} blocks. Ready to study.`);
-        } catch (error: any) {
-            setStatus("error");
-            setMessage("No captions found. Creating duration-based auto-blocks.");
-            setTimeout(() => {
-                const duration = playerRef.current?.getDuration?.() || 180;
-                setBlocks(buildFallbackBlocks(duration, Math.round((minDuration + maxDuration) / 2)));
-            }, 1000);
-        }
-        setCurrentIndex(0);
-    };
-
-    // Player controls
-    const changeSpeed = (rate: number) => {
-        setPlaybackRate(rate);
-        if (playerRef.current?.setPlaybackRate) playerRef.current.setPlaybackRate(rate);
-    };
-
-    useEffect(() => {
-        if (!currentBlock || !isPlayingBlock || !playerRef.current) return;
-        const timer = window.setInterval(() => {
-            const player = playerRef.current;
-            if (player.getPlayerState?.() !== 1) return;
-
-            const currentTime = player.getCurrentTime?.() || 0;
-            if (currentTime >= currentBlock.end - CUTOFF_COMPENSATION_SEC) {
-                if (loopCurrent) {
-                    player.seekTo(currentBlock.start, true);
-                    return;
-                }
-                player.pauseVideo();
-                setIsPlayingBlock(false);
-                player.seekTo(currentBlock.end, true);
-
-                if (autoNext && currentIndex < blocks.length - 1) {
-                    const nextIndex = currentIndex + 1;
-                    window.setTimeout(() => {
-                        const nextBlock = blocks[nextIndex];
-                        if (!nextBlock || !playerRef.current?.seekTo) return;
-                        setCurrentIndex(nextIndex);
-                        setIsPlayingBlock(true);
-                        playerRef.current.seekTo(nextBlock.start, true);
-                        playerRef.current.playVideo();
-                    }, 400);
-                }
-            }
-        }, POLL_INTERVAL_MS);
-        return () => window.clearInterval(timer);
-    }, [currentBlock, isPlayingBlock, autoNext, loopCurrent, currentIndex, blocks]);
-
-    const playBlock = (index: number) => {
-        const block = blocks[index];
-        if (!block || !playerRef.current?.seekTo) return;
-        setCurrentIndex(index);
-        setIsPlayingBlock(true);
-        playerRef.current.seekTo(block.start, true);
-        playerRef.current.playVideo();
-    };
-
-    const togglePlayBlock = () => {
-        if (!playerRef.current || !currentBlock) return;
-        isPlayingBlock ? playerRef.current.pauseVideo() : playBlock(currentIndex);
-    };
-
-    // Keyboard Shortcuts
-    useEffect(() => {
-        function handleKeyDown(e: KeyboardEvent) {
-            const target = e.target as HTMLElement;
-            if (["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName)) return;
-            if (!blocks.length) return;
-            if (e.code === "Space") { e.preventDefault(); togglePlayBlock(); }
-            else if (e.code === "ArrowRight") currentIndex < blocks.length - 1 && playBlock(currentIndex + 1);
-            else if (e.code === "ArrowLeft") currentIndex > 0 && playBlock(currentIndex - 1);
-            else if (e.key.toLowerCase() === "r") currentBlock && playBlock(currentIndex);
-            else if (e.key.toLowerCase() === "l") { setLoopCurrent(p => !p); setAutoNext(false); }
-        }
-        window.addEventListener("keydown", handleKeyDown);
-        return () => window.removeEventListener("keydown", handleKeyDown);
-    }, [blocks, currentIndex, isPlayingBlock]);
+export default function Page() {
+    const [dark, setDark] = useState(true);
+    useEffect(() => setDark(store.get("sh_dark", true)), []);
+    const switchTheme = (v: boolean) => { setDark(v); store.set("sh_dark", v); };
 
     return (
-        <main className="min-h-screen bg-[#0b1020] text-slate-50 relative overflow-hidden flex">
+        <ConfigProvider theme={{ algorithm: dark ? theme.darkAlgorithm : theme.defaultAlgorithm, token: { borderRadius: 10 } }}>
+            <AntApp>
+                <Shadowing dark={dark} onTheme={switchTheme} />
+            </AntApp>
+        </ConfigProvider>
+    );
+}
 
-            {/* ==========================================
-                FLOATING SIDEBAR (No blocking backdrop)
-            ========================================== */}
-            <aside
-                className={`fixed inset-y-0 left-0 w-80 bg-slate-900 border-r border-slate-700 z-50 shadow-[10px_0_30px_rgba(0,0,0,0.5)] transform transition-transform duration-300 ease-in-out flex flex-col ${isSidebarOpen ? "translate-x-0" : "-translate-x-full"}`}
-            >
-                <div className="p-4 border-b border-slate-800 flex justify-between items-center bg-slate-950">
-                    <h2 className="font-bold text-cyan-400">My Library</h2>
-                    <button onClick={() => setIsSidebarOpen(false)} className="text-slate-400 hover:text-white p-2 text-xl">&times;</button>
-                </div>
+// ==========================================
+// MAIN APP
+// ==========================================
+function Shadowing({ dark, onTheme }: { dark: boolean; onTheme: (v: boolean) => void }) {
+    const { message } = AntApp.useApp();
+    const { token } = theme.useToken();
 
-                {/* Tabs for Add Video vs Playlist */}
-                <div className="flex border-b border-slate-800 bg-slate-900">
-                    <button
-                        onClick={() => setAddMode("video")}
-                        className={`flex-1 py-2 text-xs font-semibold uppercase tracking-wide transition ${addMode === "video" ? "text-cyan-400 border-b-2 border-cyan-400 bg-slate-800" : "text-slate-500 hover:text-slate-300"}`}
-                    >
-                        Video
-                    </button>
-                    <button
-                        onClick={() => setAddMode("playlist")}
-                        className={`flex-1 py-2 text-xs font-semibold uppercase tracking-wide transition ${addMode === "playlist" ? "text-purple-400 border-b-2 border-purple-400 bg-slate-800" : "text-slate-500 hover:text-slate-300"}`}
-                    >
-                        Playlist
-                    </button>
-                </div>
+    const [url, setUrl] = useState("");
+    const [lang, setLang] = useState("ja");
+    const [minD, setMinD] = useState(7);
+    const [maxD, setMaxD] = useState(20);
 
-                <form onSubmit={handleAddSubmit} className="p-4 border-b border-slate-800 bg-slate-900/50">
-                    <input
-                        type="url"
-                        required
-                        value={newInputUrl}
-                        onChange={(e) => setNewInputUrl(e.target.value)}
-                        placeholder={addMode === "video" ? "Paste YouTube Video URL..." : "Paste YouTube Playlist URL..."}
-                        className={`w-full bg-slate-800 border rounded-lg p-2 text-sm outline-none mb-2 ${addMode === "video" ? "border-slate-700 focus:border-cyan-400" : "border-slate-700 focus:border-purple-400"}`}
+    const [vid, setVid] = useState<string | null>(null);
+    const [blocks, setBlocks] = useState<Block[]>([]);
+    const [idx, setIdx] = useState(0);
+    const [done, setDone] = useState<Record<string, true>>({});
+    const [status, setStatus] = useState<"idle" | "loading" | "ready">("idle");
+    const [playing, setPlaying] = useState(false);
+
+    const [mode, setMode] = useState<Mode>("off");
+    const [rate, setRate] = useState(1);
+    const [scriptMode, setScriptMode] = useState<"show" | "blur" | "hide">("blur");
+    const [revealed, setRevealed] = useState(false);
+    const [cover, setCover] = useState<"off" | "bottom" | "top">("off");
+    const [coverH, setCoverH] = useState(25);
+
+    const [drawer, setDrawer] = useState(false);
+    const [library, setLibrary] = useState<Video[]>([]);
+    const [addTab, setAddTab] = useState("video");
+    const [addInput, setAddInput] = useState("");
+    const [adding, setAdding] = useState(false);
+
+    const playerRef = useRef<any>(null);
+    const nextTimer = useRef<number>(0);
+    const listRef = useRef<HTMLDivElement>(null);
+    const live = useRef<any>({});
+
+    const cur = blocks[idx] ?? null;
+
+    useEffect(() => {
+        setLibrary(store.get("sh_library", []));
+        setUrl(store.get("sh_url", ""));
+        return () => { clearTimeout(nextTimer.current); playerRef.current?.destroy?.(); };
+    }, []);
+
+    // lưu tiến độ theo video
+    useEffect(() => {
+        if (vid && blocks.length) store.set(`sh_p_${vid}`, { idx, done });
+    }, [vid, blocks, idx, done]);
+
+    // cuộn danh sách tới block hiện tại (chỉ trong khung danh sách, không kéo cả trang)
+    useEffect(() => {
+        const el = document.getElementById(`blk-${idx}`), box = listRef.current;
+        if (el && box) box.scrollTo({ top: el.offsetTop - box.clientHeight / 2 + el.clientHeight / 2, behavior: "smooth" });
+    }, [idx, blocks]);
+
+    // ---------- Player ----------
+    const ensurePlayer = async (id: string) => {
+        await loadYouTubeApi();
+        const p = playerRef.current;
+        if (p?.cueVideoById) { p.pauseVideo?.(); p.cueVideoById(id); return; } // cue = nạp video nhưng KHÔNG tự phát
+        await new Promise<void>((resolve) => {
+            playerRef.current = new window.YT.Player("yt-player", {
+                videoId: id, width: "100%", height: "100%",
+                playerVars: { autoplay: 0, controls: 0, disablekb: 1, rel: 0, playsinline: 1, modestbranding: 1, iv_load_policy: 3, cc_load_policy: 0 },
+                events: {
+                    onReady: (e: any) => { e.target.unloadModule?.("captions"); resolve(); },
+                    onStateChange: (e: any) => {
+                        const S = window.YT.PlayerState;
+                        if (e.data === S.PLAYING) {
+                            setPlaying(true);
+                            if (e.target.getPlaybackRate() !== live.current.rate) e.target.setPlaybackRate(live.current.rate);
+                        } else if (e.data === S.PAUSED || e.data === S.ENDED) setPlaying(false);
+                    },
+                },
+            });
+        });
+    };
+
+    const playBlock = (i: number) => {
+        const b = live.current.blocks[i], p = playerRef.current;
+        if (!b || !p?.seekTo) return;
+        clearTimeout(nextTimer.current);
+        setIdx(i); setRevealed(false); setPlaying(true);
+        p.seekTo(b.start, true);
+        p.playVideo();
+    };
+    const toggle = () => (live.current.playing ? playerRef.current?.pauseVideo() : playBlock(live.current.idx));
+    const changeRate = (r: number) => { setRate(r); playerRef.current?.setPlaybackRate?.(r); };
+
+    live.current = { blocks, idx, mode, rate, playing };
+
+    // ---------- Dừng đúng cuối block ----------
+    useEffect(() => {
+        if (!playing) return;
+        const timer = window.setInterval(() => {
+            const p = playerRef.current, { blocks, idx, mode, rate } = live.current, b: Block | undefined = blocks[idx];
+            if (!p || !b || p.getPlayerState?.() !== 1 || p.getCurrentTime() < b.end - CUTOFF) return;
+            if (mode === "loop") return void p.seekTo(b.start, true);
+
+            p.pauseVideo();
+            setPlaying(false);
+            if ((mode === "next" || mode === "shadow") && idx < blocks.length - 1) {
+                const wait = mode === "shadow" ? ((b.end - b.start) / rate) * 1000 + 300 : 400;
+                clearTimeout(nextTimer.current);
+                nextTimer.current = window.setTimeout(() => playBlock(idx + 1), wait);
+            }
+        }, POLL_MS);
+        return () => window.clearInterval(timer);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [playing]);
+
+    // ---------- Phím tắt ----------
+    useEffect(() => {
+        const onKey = (e: KeyboardEvent) => {
+            if (["INPUT", "TEXTAREA", "SELECT"].includes((e.target as HTMLElement).tagName)) return;
+            const { blocks, idx } = live.current;
+            if (!blocks.length) return;
+            const k = e.key.toLowerCase();
+            if (e.code === "Space") { e.preventDefault(); toggle(); }
+            else if (e.code === "ArrowRight" && idx < blocks.length - 1) playBlock(idx + 1);
+            else if (e.code === "ArrowLeft" && idx > 0) playBlock(idx - 1);
+            else if (k === "r") playBlock(idx);
+            else if (k === "l") setMode((m) => (m === "loop" ? "off" : "loop"));
+            else if (k === "b") setRevealed((v) => !v);
+        };
+        window.addEventListener("keydown", onKey);
+        return () => window.removeEventListener("keydown", onKey);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
+    // ---------- Load ----------
+    const load = async (u = url) => {
+        const id = videoIdOf(u);
+        if (!id) return message.error("URL YouTube không hợp lệ");
+        store.set("sh_url", u);
+        setUrl(u); setVid(id); setStatus("loading"); setBlocks([]); setIdx(0); setDone({}); setPlaying(false); setRevealed(false);
+        clearTimeout(nextTimer.current);
+
+        await ensurePlayer(id);
+        let list: Block[];
+        try {
+            const q = new URLSearchParams({ videoId: id, lang, minDuration: String(minD), maxDuration: String(maxD) });
+            const res = await (await fetch(`/api/transcript?${q}`)).json();
+            if (!res.success || !res.data.length) throw new Error(res.error);
+            list = res.data;
+            message.success(`Đã tách ${list.length} block`);
+        } catch {
+            await new Promise((r) => setTimeout(r, 800)); // đợi player có duration
+            list = fallbackBlocks(playerRef.current?.getDuration?.() || 180, (minD + maxD) / 2);
+            message.warning("Không có phụ đề — chia theo thời lượng");
+        }
+        const saved = store.get<{ idx: number; done: Record<string, true> }>(`sh_p_${id}`, { idx: 0, done: {} });
+        const ids = new Set(list.map((b) => b.id));
+        setBlocks(list);
+        setIdx(Math.min(saved.idx, list.length - 1));
+        setDone(Object.fromEntries(Object.keys(saved.done).filter((k) => ids.has(k)).map((k) => [k, true as const])));
+        setStatus("ready");
+    };
+
+    // ---------- Library ----------
+    const updateLibrary = (next: Video[]) => { setLibrary(next); store.set("sh_library", next); };
+    const addToLibrary = (items: Video[]) => {
+        const fresh = items.filter((v) => !library.some((l) => l.id === v.id));
+        if (fresh.length) updateLibrary([...fresh, ...library]);
+        return fresh.length;
+    };
+    const submitAdd = async (value: string) => {
+        setAdding(true);
+        try {
+            if (addTab === "video") {
+                const id = videoIdOf(value);
+                if (!id) return message.error("URL video không hợp lệ");
+                const added = addToLibrary([{ id, title: await fetchTitle(value), thumbnail: thumb(id) }]);
+                added ? message.success("Đã thêm video") : message.info("Video đã có trong thư viện");
+            } else {
+                const pl = playlistIdOf(value);
+                if (!pl) return message.error("URL playlist không hợp lệ");
+                const res = await (await fetch(`/api/transcript?playlist=${pl}`)).json();
+                if (!res.success) throw new Error(res.error);
+                message.success(`Đã thêm ${addToLibrary(res.data)} video`);
+            }
+            setAddInput("");
+        } catch (e: any) {
+            message.error(e?.message || "Có lỗi xảy ra");
+        } finally {
+            setAdding(false);
+        }
+    };
+
+    const onPass = useCallback((id: string) => setDone((d) => (d[id] ? d : { ...d, [id]: true })), []);
+    const doneCount = Object.keys(done).length;
+    const scriptHidden = scriptMode !== "show" && !revealed;
+
+    return (
+        <div style={{ minHeight: "100vh", background: token.colorBgLayout, color: token.colorText }}>
+            <style>{CSS}</style>
+            <div style={{ maxWidth: 1200, margin: "0 auto", padding: "12px 12px 32px" }}>
+                {/* ---------- Header ---------- */}
+                <Flex gap={8} wrap align="center" style={{ marginBottom: 12 }}>
+                    <Button icon={<MenuOutlined />} onClick={() => setDrawer(true)} />
+                    <Input
+                        allowClear value={url} onChange={(e) => setUrl(e.target.value)} onPressEnter={() => load()}
+                        placeholder="Dán link YouTube..." style={{ flex: "1 1 220px", minWidth: 0 }}
                     />
-                    <button
-                        type="submit"
-                        disabled={isAddingPlaylist}
-                        className={`w-full text-sm font-semibold rounded-lg py-2 transition disabled:opacity-50 ${addMode === "video" ? "bg-cyan-600 hover:bg-cyan-500" : "bg-purple-600 hover:bg-purple-500"}`}
+                    <Select value={lang} onChange={setLang} options={LANGS} style={{ width: 130 }} />
+                    <Popover
+                        trigger="click" title="Độ dài block (giây)"
+                        content={
+                            <Flex vertical gap={8} style={{ width: 200 }}>
+                                <Flex justify="space-between" align="center">Tối thiểu
+                                    <InputNumber size="small" min={2} max={maxD - 1} value={minD} onChange={(v) => setMinD(v ?? 7)} />
+                                </Flex>
+                                <Flex justify="space-between" align="center">Tối đa
+                                    <InputNumber size="small" min={minD + 1} max={120} value={maxD} onChange={(v) => setMaxD(v ?? 20)} />
+                                </Flex>
+                                <Text type="secondary" style={{ fontSize: 12 }}>Là độ dài mục tiêu, thuật toán vẫn ưu tiên ngắt ở chỗ tự nhiên. Bấm Load để áp dụng.</Text>
+                            </Flex>
+                        }
                     >
-                        {isAddingPlaylist ? "Processing..." : (addMode === "video" ? "+ Add Video" : "+ Import Playlist")}
-                    </button>
-                </form>
+                        <Button icon={<SettingOutlined />} />
+                    </Popover>
+                    <Switch checked={dark} onChange={onTheme} checkedChildren={<MoonOutlined />} unCheckedChildren={<SunOutlined />} />
+                    <Button type="primary" loading={status === "loading"} onClick={() => load()}>Load</Button>
+                </Flex>
 
-                <div className="flex-1 overflow-y-auto custom-scrollbar p-2">
-                    {library.length === 0 ? (
-                        <p className="text-sm text-slate-500 text-center mt-10">Library is empty.</p>
-                    ) : (
-                        library.map((vid) => (
-                            <div
-                                key={vid.id}
-                                onClick={() => loadFromLibrary(vid.url)}
-                                className={`flex gap-3 p-2 rounded-xl mb-2 cursor-pointer transition group border ${sourceUrl === vid.url ? 'bg-slate-800 border-cyan-500/50' : 'bg-transparent border-transparent hover:bg-slate-800 hover:border-slate-700'}`}
-                            >
-                                <img src={vid.thumbnail} alt={vid.title} className="w-20 h-14 object-cover rounded-md bg-black shrink-0" />
-                                <div className="flex-1 min-w-0">
-                                    <p className="text-xs font-medium text-slate-200 line-clamp-2 leading-tight mb-1">{vid.title}</p>
-                                    <button onClick={(e) => removeVideo(vid.id, e)} className="text-xs text-rose-500 hover:text-rose-400 opacity-0 group-hover:opacity-100 transition">Delete</button>
-                                </div>
-                            </div>
-                        ))
-                    )}
-                </div>
-            </aside>
-
-            {/* ==========================================
-                MAIN CONTENT (Not shrinked, fully interactive)
-            ========================================== */}
-            <div className="flex-1 p-4 sm:p-6 w-full max-w-6xl mx-auto flex flex-col min-h-screen relative z-10">
-                <header className="flex flex-col gap-3 mb-6 relative">
-                    <div className="flex flex-col sm:flex-row gap-3">
-                        <button
-                            onClick={() => setIsSidebarOpen(prev => !prev)}
-                            className="bg-slate-800 hover:bg-slate-700 p-3 rounded-xl border border-slate-700 transition flex items-center justify-center shrink-0 w-12"
-                            title="Toggle Library"
-                        >
-                            ☰
-                        </button>
-
-                        <div className="flex-1">
-                            <input
-                                value={sourceUrl}
-                                onChange={(e) => setSourceUrl(e.target.value)}
-                                className="w-full rounded-xl bg-slate-900 p-3 border border-slate-700 outline-none focus:border-cyan-400"
-                                placeholder="Paste a YouTube link..."
-                            />
-                        </div>
-
-                        <div className="flex gap-3 shrink-0">
-                            <select
-                                value={language}
-                                onChange={(e) => setLanguage(e.target.value)}
-                                className="bg-slate-900 border border-slate-700 rounded-xl p-3 outline-none focus:border-cyan-400 cursor-pointer"
-                            >
-                                {SUPPORTED_LANGUAGES.map(lang => (
-                                    <option key={lang.code} value={lang.code}>{lang.label}</option>
-                                ))}
-                            </select>
-
-                            <button onClick={() => setShowSettings((s) => !s)} className="px-4 bg-slate-800 hover:bg-slate-700 rounded-xl font-medium transition border border-slate-700">⚙</button>
-                            <button
-                                onClick={() => handleFetch()}
-                                disabled={status === "loading"}
-                                className="bg-cyan-600 text-slate-100 px-8 rounded-xl font-bold hover:bg-cyan-500 transition disabled:opacity-50"
-                            >
-                                {status === "loading" ? "Analyzing..." : "Load Data"}
-                            </button>
-                        </div>
-                    </div>
-
-                    {showSettings && (
-                        <div className="flex flex-wrap gap-6 p-5 rounded-xl bg-slate-900/80 border border-slate-800 mt-2">
-                            <div className="flex flex-col gap-1">
-                                <label className="text-xs uppercase tracking-wider text-slate-400">Min block (s)</label>
-                                <input type="number" min={2} max={maxDuration - 1} value={minDuration} onChange={(e) => setMinDuration(Number(e.target.value) || DEFAULT_MIN_DURATION)} className="w-24 rounded-lg bg-slate-950 p-2 border border-slate-700 outline-none focus:border-cyan-400 text-sm" />
-                            </div>
-                            <div className="flex flex-col gap-1">
-                                <label className="text-xs uppercase tracking-wider text-slate-400">Max block (s)</label>
-                                <input type="number" min={minDuration + 1} max={120} value={maxDuration} onChange={(e) => setMaxDuration(Number(e.target.value) || DEFAULT_MAX_DURATION)} className="w-24 rounded-lg bg-slate-950 p-2 border border-slate-700 outline-none focus:border-cyan-400 text-sm" />
-                            </div>
-                        </div>
-                    )}
-                </header>
-
-                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 flex-1">
-                    <section className="flex flex-col gap-4">
-                        <div className="aspect-video bg-black rounded-xl overflow-hidden border border-slate-800 shadow-2xl relative">
-                            <div id="youtube-player" className="w-full h-full" />
-                        </div>
-
-                        <div className="flex justify-between items-center mt-1">
-                            <p className={`text-sm font-medium ${status === "error" ? "text-amber-400" : "text-cyan-400"}`}>
-                                {message}
-                            </p>
-                            <div className="flex items-center gap-1 bg-slate-800 rounded-lg p-1 border border-slate-700">
-                                {PLAYBACK_SPEEDS.map(speed => (
-                                    <button
-                                        key={speed} onClick={() => changeSpeed(speed)}
-                                        className={`px-2 py-1 text-xs font-bold rounded ${playbackRate === speed ? 'bg-cyan-600 text-white' : 'text-slate-400 hover:text-white hover:bg-slate-700'}`}
+                <Row gutter={[16, 16]}>
+                    {/* ---------- Left: video + controls ---------- */}
+                    <Col xs={24} lg={12}>
+                        <Flex vertical gap={12}>
+                            <div style={{ position: "relative", aspectRatio: "16/9", background: "#000", borderRadius: 12, overflow: "hidden" }}>
+                                <div style={{ position: "absolute", inset: 0 }}><div id="yt-player" /></div>
+                                {cover !== "off" && (
+                                    <div
+                                        style={{
+                                            position: "absolute", left: 0, right: 0, [cover]: 0, height: `${coverH}%`,
+                                            background: dark ? "#141414" : "#f0f0f0", color: token.colorTextTertiary,
+                                            display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none",
+                                        }}
                                     >
-                                        {speed}x
-                                    </button>
-                                ))}
-                            </div>
-                        </div>
-
-                        {blocks.length > 0 && (
-                            <div className="h-1.5 bg-slate-800 rounded-full overflow-hidden">
-                                <div className="h-full bg-cyan-500 transition-all duration-300" style={{ width: `${((currentIndex + 1) / blocks.length) * 100}%` }} />
-                            </div>
-                        )}
-
-                        <div className="grid grid-cols-4 gap-2">
-                            <button onClick={() => currentIndex > 0 && playBlock(currentIndex - 1)} disabled={currentIndex === 0} className="bg-slate-800 hover:bg-slate-700 py-3 rounded-xl font-bold transition border border-slate-700 disabled:opacity-40">⏮ Prev</button>
-                            <button onClick={togglePlayBlock} disabled={!currentBlock} className="bg-violet-600 hover:bg-violet-500 py-3 rounded-xl font-bold transition disabled:opacity-40 text-white">
-                                {isPlayingBlock ? "⏸ Pause" : "▶ Play"}
-                            </button>
-                            <button onClick={() => currentBlock && playBlock(currentIndex)} disabled={!currentBlock} className="bg-slate-800 hover:bg-slate-700 py-3 rounded-xl font-bold transition border border-slate-700 disabled:opacity-40">↺ Replay</button>
-                            <button onClick={() => currentIndex < blocks.length - 1 && playBlock(currentIndex + 1)} disabled={currentIndex >= blocks.length - 1} className="bg-slate-800 hover:bg-slate-700 py-3 rounded-xl font-bold transition border border-slate-700 disabled:opacity-40">Next ⏭</button>
-                        </div>
-
-                        <div className="flex gap-2">
-                            <button onClick={() => setIsBlind(!isBlind)} className="flex-1 py-3 bg-slate-900 hover:bg-slate-800 rounded-xl font-medium transition border flex gap-2 justify-center items-center">
-                                {isBlind ? "👁️ Show Script" : "🙈 Blind Mode"}
-                            </button>
-                            <button onClick={() => { setLoopCurrent(!loopCurrent); setAutoNext(false); }} className={`flex-1 py-3 rounded-xl font-medium transition border flex justify-center items-center gap-2 ${loopCurrent ? 'bg-amber-900/50 border-amber-500 text-amber-400' : 'bg-slate-900 border-slate-700 hover:bg-slate-800'}`}>
-                                🔁 Auto-Loop
-                            </button>
-                            <button onClick={() => { setAutoNext(!autoNext); setLoopCurrent(false); }} className={`flex-1 py-3 rounded-xl font-medium transition border flex justify-center items-center gap-2 ${autoNext ? 'bg-emerald-900/50 border-emerald-500 text-emerald-400' : 'bg-slate-900 border-slate-700 hover:bg-slate-800'}`}>
-                                ⏭️ Auto-Next
-                            </button>
-                        </div>
-                    </section>
-
-                    <section className="flex flex-col gap-4 lg:h-[calc(100vh-140px)]">
-                        <div className="p-5 border border-slate-700 rounded-xl bg-slate-800/40 min-h-[140px] flex flex-col justify-center shadow-inner relative">
-                            <span className="absolute top-3 right-4 text-xs font-bold text-slate-500 bg-slate-900 px-2 py-1 rounded">
-                                {blocks.length > 0 ? `${currentIndex + 1} / ${blocks.length}` : "0 / 0"}
-                            </span>
-                            {!isBlind ? (
-                                <p className="text-xl text-slate-100 leading-relaxed font-medium">
-                                    {currentBlock?.text || "Load a video to see transcripts here."}
-                                </p>
-                            ) : (
-                                <div className="flex items-center gap-2 text-slate-500">
-                                    <span className="text-2xl">🙈</span>
-                                    <span>Script is hidden. Focus on listening.</span>
-                                </div>
-                            )}
-                        </div>
-
-                        <DictationBox key={currentBlock?.id ?? "empty"} expectedText={currentBlock?.text ?? ""} />
-
-                        <div className="flex-1 overflow-y-auto pr-2 flex flex-col gap-2 custom-scrollbar max-h-80 lg:max-h-none mt-2">
-                            {blocks.map((b, i) => (
-                                <button
-                                    key={b.id} onClick={() => playBlock(i)}
-                                    className={`p-3 text-left border rounded-xl transition ${i === currentIndex ? "border-cyan-500 bg-cyan-900/30" : "border-slate-800 hover:bg-slate-800/80 bg-slate-900/40"}`}
-                                >
-                                    <div className="flex justify-between items-center mb-1">
-                                        <span className={`font-bold ${i === currentIndex ? 'text-cyan-400' : 'text-slate-400'}`}>Block {i + 1}</span>
-                                        <span className="text-xs text-slate-500 font-mono">{b.start.toFixed(1)}s - {b.end.toFixed(1)}s</span>
+                                        Phụ đề đang được che
                                     </div>
-                                    <p className={`text-sm line-clamp-2 ${i === currentIndex ? 'text-slate-200' : 'text-slate-500'}`}>{b.text}</p>
-                                </button>
-                            ))}
-                        </div>
-                    </section>
-                </div>
+                                )}
+                            </div>
+
+                            {blocks.length > 0 && (
+                                <Flex align="center" gap={12}>
+                                    <Progress percent={Math.round(((idx + 1) / blocks.length) * 100)} showInfo={false} size="small" style={{ flex: 1, margin: 0 }} />
+                                    <Text type="secondary" style={{ whiteSpace: "nowrap" }}>Đã chuẩn {doneCount}/{blocks.length}</Text>
+                                </Flex>
+                            )}
+
+                            <Flex gap={8}>
+                                <Button size="large" icon={<StepBackwardOutlined />} disabled={!cur || idx === 0} onClick={() => playBlock(idx - 1)} />
+                                <Button size="large" type="primary" style={{ flex: 2 }} disabled={!cur} onClick={toggle}
+                                    icon={playing ? <PauseCircleFilled /> : <PlayCircleFilled />}>
+                                    {playing ? "Pause" : "Play"}
+                                </Button>
+                                <Button size="large" style={{ flex: 1 }} icon={<ReloadOutlined />} disabled={!cur} onClick={() => playBlock(idx)}>Replay</Button>
+                                <Button size="large" icon={<StepForwardOutlined />} disabled={!cur || idx >= blocks.length - 1} onClick={() => playBlock(idx + 1)} />
+                            </Flex>
+
+                            <Card size="small">
+                                <Flex vertical gap={12}>
+                                    <Flex align="center" gap={8} wrap>
+                                        <Text type="secondary" style={{ width: 72 }}>Tốc độ</Text>
+                                        <Segmented size="small" value={rate} onChange={changeRate} options={SPEEDS.map((s) => ({ label: `${s}x`, value: s }))} />
+                                    </Flex>
+                                    <div>
+                                        <Flex align="center" gap={8} wrap>
+                                            <Text type="secondary" style={{ width: 72 }}>Chế độ</Text>
+                                            <Segmented size="small" value={mode} onChange={(v) => setMode(v as Mode)}
+                                                options={[{ label: "Tắt", value: "off" }, { label: "Lặp", value: "loop" }, { label: "Tự chuyển", value: "next" }, { label: "Shadow", value: "shadow" }]} />
+                                        </Flex>
+                                        <Text type="secondary" style={{ fontSize: 12 }}>{MODE_HINT[mode]}</Text>
+                                    </div>
+                                    <Flex align="center" gap={8} wrap>
+                                        <Text type="secondary" style={{ width: 72 }}>Che phụ đề</Text>
+                                        <Segmented size="small" value={cover} onChange={(v) => setCover(v as typeof cover)}
+                                            options={[{ label: "Tắt", value: "off" }, { label: "Dưới", value: "bottom" }, { label: "Trên", value: "top" }]} />
+                                        {cover !== "off" && <Slider min={10} max={50} value={coverH} onChange={setCoverH} style={{ flex: 1, minWidth: 100, margin: "0 8px" }} />}
+                                    </Flex>
+                                </Flex>
+                            </Card>
+                            <Text type="secondary" style={{ fontSize: 12 }}>Phím tắt: Space phát/dừng · ←/→ block · R nghe lại · L lặp · B hiện/ẩn script</Text>
+                        </Flex>
+                    </Col>
+
+                    {/* ---------- Right: script + dictation + list ---------- */}
+                    <Col xs={24} lg={12}>
+                        <Spin spinning={status === "loading"} tip="Đang tải phụ đề...">
+                            <Flex vertical gap={12}>
+                                <Card
+                                    size="small"
+                                    title={`Block ${blocks.length ? idx + 1 : 0} / ${blocks.length}`}
+                                    extra={
+                                        <Segmented size="small" value={scriptMode} onChange={(v) => { setScriptMode(v as typeof scriptMode); setRevealed(false); }}
+                                            options={[{ label: "Hiện", value: "show" }, { label: "Mờ", value: "blur" }, { label: "Ẩn", value: "hide" }]} />
+                                    }
+                                >
+                                    <div
+                                        onClick={() => scriptMode !== "show" && setRevealed((r) => !r)}
+                                        className={scriptMode === "blur" && scriptHidden ? "blur-text" : ""}
+                                        style={{ fontSize: 20, lineHeight: 1.6, minHeight: 64, cursor: scriptMode === "show" ? "default" : "pointer" }}
+                                    >
+                                        {scriptMode === "hide" && scriptHidden
+                                            ? <Text type="secondary">Script đang ẩn — bấm để xem</Text>
+                                            : cur?.text ?? <Text type="secondary">Load video để bắt đầu.</Text>}
+                                    </div>
+                                </Card>
+
+                                <Dictation key={cur?.id ?? "empty"} id={cur?.id ?? ""} expected={cur?.text ?? ""} onPass={onPass} />
+
+                                <div ref={listRef} style={{ position: "relative", maxHeight: 340, overflowY: "auto" }}>
+                                    <Flex vertical gap={6}>
+                                        {blocks.map((b, i) => {
+                                            const hide = scriptMode !== "show" && !done[b.id];
+                                            return (
+                                                <div
+                                                    key={b.id} id={`blk-${i}`} onClick={() => playBlock(i)}
+                                                    style={{
+                                                        padding: "8px 12px", borderRadius: 10, cursor: "pointer",
+                                                        border: `1px solid ${i === idx ? token.colorPrimary : token.colorBorderSecondary}`,
+                                                        background: i === idx ? token.colorPrimaryBg : token.colorBgContainer,
+                                                    }}
+                                                >
+                                                    <Flex justify="space-between">
+                                                        <Text strong type={i === idx ? undefined : "secondary"}>{done[b.id] ? "✓ " : ""}Block {i + 1}</Text>
+                                                        <Text type="secondary" style={{ fontSize: 12 }}>{b.start.toFixed(1)}s – {b.end.toFixed(1)}s</Text>
+                                                    </Flex>
+                                                    <div className={hide && scriptMode === "blur" ? "blur-text" : ""}
+                                                        style={{ fontSize: 13, color: token.colorTextSecondary, display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>
+                                                        {hide && scriptMode === "hide" ? "•••" : b.text}
+                                                    </div>
+                                                </div>
+                                            );
+                                        })}
+                                    </Flex>
+                                </div>
+                            </Flex>
+                        </Spin>
+                    </Col>
+                </Row>
             </div>
-        </main>
+
+            {/* ---------- Library drawer ---------- */}
+            <Drawer title="Thư viện" placement="left" width={360} open={drawer} onClose={() => setDrawer(false)} styles={{ body: { padding: 12 } }}>
+                <Tabs size="small" activeKey={addTab} onChange={setAddTab} items={[{ key: "video", label: "Video" }, { key: "playlist", label: "Playlist" }]} />
+                <Input.Search
+                    value={addInput} onChange={(e) => setAddInput(e.target.value)} loading={adding} onSearch={submitAdd}
+                    enterButton={addTab === "video" ? "Thêm" : "Import"}
+                    placeholder={addTab === "video" ? "Dán link video..." : "Dán link playlist..."}
+                />
+                <List
+                    style={{ marginTop: 12 }} dataSource={library} locale={{ emptyText: "Thư viện trống" }}
+                    renderItem={(v) => (
+                        <List.Item
+                            style={{ cursor: "pointer", padding: 8, borderRadius: 8, background: v.id === vid ? token.colorPrimaryBg : undefined }}
+                            onClick={() => { setDrawer(false); load(`https://www.youtube.com/watch?v=${v.id}`); }}
+                            actions={[<Button key="del" type="text" danger size="small" icon={<DeleteOutlined />}
+                                onClick={(e) => { e.stopPropagation(); updateLibrary(library.filter((x) => x.id !== v.id)); }} />]}
+                        >
+                            <List.Item.Meta
+                                avatar={<img src={v.thumbnail} alt="" style={{ width: 72, height: 48, objectFit: "cover", borderRadius: 6 }} />}
+                                title={<Typography.Paragraph ellipsis={{ rows: 2 }} style={{ margin: 0, fontSize: 13 }}>{v.title}</Typography.Paragraph>}
+                            />
+                        </List.Item>
+                    )}
+                />
+            </Drawer>
+        </div>
     );
 }

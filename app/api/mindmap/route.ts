@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path';
 import Database from 'better-sqlite3';
 import { NextRequest, NextResponse } from 'next/server';
 import { getCurrentUser } from '@/lib/server/auth';
+import { saveMindmapFlashcard } from '@/lib/server/db';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -269,7 +270,8 @@ export async function GET(req: NextRequest) {
             const language = req.nextUrl.searchParams.get('language');
             if (!notebookId) return badRequest('notebookId is required');
             if (!isLanguage(language)) return badRequest('language is invalid');
-            const rows = db.prepare(`SELECT n.*, COALESCE(t.text, n.text) AS display_text
+            const rows = db.prepare(`SELECT n.*, COALESCE(t.text, n.text) AS display_text,
+                    CASE WHEN t.node_id IS NULL THEN 0 ELSE 1 END AS has_translation
                 FROM mindmap_nodes n
                 LEFT JOIN mindmap_node_translations t ON t.node_id = n.id AND t.language = ? AND t.source_hash = n.source_hash
                 WHERE n.notebook_id = ? ORDER BY n.created_at ASC`).all(language, notebookId);
@@ -284,6 +286,54 @@ export async function POST(req: NextRequest) {
     const db = getDb();
     try {
         const body = await req.json();
+
+        if (body.resource === 'flashcard') {
+            const user = await getCurrentUser();
+            if (!user) return NextResponse.json({ error: 'Please sign in again.' }, { status: 401 });
+
+            const nodeId = typeof body.nodeId === 'string' ? body.nodeId.trim() : '';
+            const language = isLanguage(body.language) ? body.language : null;
+            const front = typeof body.front === 'string' ? body.front.slice(0, 10000) : '';
+            const context = typeof body.context === 'string' ? body.context.slice(0, 5000) : '';
+            const rawChildren: unknown[] = Array.isArray(body.children) ? body.children.slice(0, 200) : [];
+            const children = rawChildren.flatMap((item): Array<{ id: string; text: string }> => {
+                if (!item || typeof item !== 'object') return [];
+                const child = item as Record<string, unknown>;
+                const id = typeof child.id === 'string' ? child.id.trim() : '';
+                const text = typeof child.text === 'string' ? child.text.slice(0, 10000) : '';
+                return id && text.trim() ? [{ id, text }] : [];
+            });
+            if (!nodeId || !language || !front.trim() || children.length === 0) {
+                return badRequest('A node, front text, language, and at least one child are required.');
+            }
+
+            const node = db.prepare(`SELECT n.id, n.notebook_id, b.title AS notebook_title
+                FROM mindmap_nodes n
+                JOIN mindmap_notebooks b ON b.id = n.notebook_id
+                WHERE n.id = ? AND b.deleted_at IS NULL`).get(nodeId) as {
+                id: string; notebook_id: string; notebook_title: string;
+            } | undefined;
+            if (!node) return NextResponse.json({ error: 'Node not found' }, { status: 404 });
+
+            const directChildIds = new Set((db.prepare(`
+                SELECT id FROM mindmap_nodes WHERE notebook_id = ? AND parent_id = ?
+            `).all(node.notebook_id, nodeId) as Array<{ id: string }>).map((child) => child.id));
+            if (children.some((child) => !directChildIds.has(child.id))) {
+                return badRequest('Flashcard answers must come from direct child nodes.');
+            }
+
+            const id = saveMindmapFlashcard(user.user_id, {
+                id: randomUUID(),
+                language,
+                notebookId: node.notebook_id,
+                notebookTitle: node.notebook_title,
+                nodeId: node.id,
+                front,
+                context,
+                children: children.map((child) => child.text),
+            });
+            return NextResponse.json({ id });
+        }
 
         if (body.resource === 'translate-node') {
             if (!await getCurrentUser()) return NextResponse.json({ error: 'Vui lòng đăng nhập lại.' }, { status: 401 });
@@ -607,20 +657,29 @@ export async function PATCH(req: NextRequest) {
             const language: Language = isLanguage(body.language) ? body.language : existing.source_language;
             const hasTextUpdate = typeof text === 'string';
             const cleanText = hasTextUpdate ? text.slice(0, 10000) : existing.text;
-            const textChanged = hasTextUpdate && (cleanText !== existing.text || language !== existing.source_language);
-            const savedSourceLanguage = textChanged ? language : existing.source_language;
-            const savedSourceHash = textChanged ? sourceHash(savedSourceLanguage, cleanText) : existing.source_hash;
+            const sourceTextChanged = hasTextUpdate
+                && language === existing.source_language
+                && cleanText !== existing.text;
+            const savedSourceLanguage = existing.source_language;
+            const savedSourceHash = sourceTextChanged
+                ? sourceHash(savedSourceLanguage, cleanText)
+                : existing.source_hash;
             db.prepare(`UPDATE mindmap_nodes
                                     SET text = ?, x = ?, y = ?, width = ?, height = ?, auto_width = ?, preserve_aspect = ?, color = ?, parent_id = ?, text_align = ?, type = ?, image_url = ?, source_language = ?, source_hash = ?, translation_pending = ?, translation_auto = ?, updated_at = ?
                   WHERE id = ?`).run(
-                cleanText, x ?? existing.x, y ?? existing.y, width ?? existing.width, height ?? existing.height,
+                sourceTextChanged ? cleanText : existing.text, x ?? existing.x, y ?? existing.y, width ?? existing.width, height ?? existing.height,
                 savedAutoWidth, savedPreserveAspect, color !== undefined ? color : existing.color,
                 parentId !== undefined ? parentId : existing.parent_id, validTextAlign, validType,
                 imageUrl !== undefined ? imageUrl : existing.image_url, savedSourceLanguage, savedSourceHash,
-                textChanged ? Number(Boolean(cleanText.trim())) : existing.translation_pending,
-                textChanged ? Number(Boolean(cleanText.trim())) : existing.translation_auto, nowIso(), id
+                sourceTextChanged ? Number(Boolean(cleanText.trim())) : existing.translation_pending,
+                sourceTextChanged ? Number(Boolean(cleanText.trim())) : existing.translation_auto, nowIso(), id
             );
-            if (textChanged) {
+            if (hasTextUpdate && language !== existing.source_language) {
+                db.prepare(`INSERT INTO mindmap_node_translations (node_id, language, text, source_hash, updated_at)
+                    VALUES (?, ?, ?, ?, ?) ON CONFLICT(node_id, language) DO UPDATE SET
+                    text = excluded.text, source_hash = excluded.source_hash, updated_at = excluded.updated_at`)
+                    .run(id, language, cleanText, existing.source_hash, nowIso());
+            } else if (sourceTextChanged) {
                 db.prepare(`INSERT INTO mindmap_node_translations (node_id, language, text, source_hash, updated_at)
                     VALUES (?, ?, ?, ?, ?) ON CONFLICT(node_id, language) DO UPDATE SET
                     text = excluded.text, source_hash = excluded.source_hash, updated_at = excluded.updated_at`)
@@ -641,7 +700,7 @@ export async function PATCH(req: NextRequest) {
                 ? body.remove.filter((v: unknown): v is string => typeof v === 'string').slice(0, 2000) : [];
             const num = (v: unknown, fallback: number) => (typeof v === 'number' && Number.isFinite(v) ? v : fallback);
 
-            const getExisting = db.prepare('SELECT notebook_id, text, source_language, translation_pending, translation_auto FROM mindmap_nodes WHERE id = ?');
+            const getExisting = db.prepare('SELECT notebook_id, text, source_language, source_hash, translation_pending, translation_auto FROM mindmap_nodes WHERE id = ?');
             const upsertNode = db.prepare(`INSERT INTO mindmap_nodes
                 (id, notebook_id, parent_id, text, x, y, type, width, height, auto_width, image_url, preserve_aspect, color, text_align, source_language, source_hash, translation_pending, translation_auto)
                 VALUES (@id, @notebookId, @parentId, @text, @x, @y, @type, @width, @height, @autoWidth, @imageUrl, @preserveAspect, @color, @textAlign, @language, @hash, @pending, @auto)
@@ -654,31 +713,41 @@ export async function PATCH(req: NextRequest) {
             const upsertTranslation = db.prepare(`INSERT INTO mindmap_node_translations (node_id, language, text, source_hash, updated_at)
                 VALUES (?, ?, ?, ?, ?) ON CONFLICT(node_id, language) DO UPDATE SET
                 text = excluded.text, source_hash = excluded.source_hash, updated_at = excluded.updated_at`);
+            const deleteTranslation = db.prepare(`DELETE FROM mindmap_node_translations
+                WHERE node_id = ? AND language = ? AND source_hash = ?`);
             const removeNode = db.prepare('DELETE FROM mindmap_nodes WHERE id = ? AND notebook_id = ?');
 
             // Thứ tự: upsert (cha trước con, client đã sort) rồi mới xóa, để node còn sống được gắn lại cha trước khi cascade.
             db.transaction(() => {
                 for (const raw of upserts) {
                     if (!raw || typeof raw.id !== 'string') continue;
-                    const existing = getExisting.get(raw.id) as { notebook_id: string; text: string; source_language: Language; translation_pending: number; translation_auto: number } | undefined;
+                    const existing = getExisting.get(raw.id) as { notebook_id: string; text: string; source_language: Language; source_hash: string; translation_pending: number; translation_auto: number } | undefined;
                     if (existing && existing.notebook_id !== notebookId) continue;
                     const language: Language = isLanguage(raw.language) ? raw.language : 'vi';
                     const text = typeof raw.text === 'string' ? raw.text.slice(0, 10000) : '';
-                    const textChanged = !existing || existing.text !== text || existing.source_language !== language;
-                    const hash = sourceHash(language, text);
+                    const updatesSource = !existing || language === existing.source_language;
+                    const sourceText = updatesSource ? text : existing.text;
+                    const sourceLanguage = updatesSource ? language : existing.source_language;
+                    const sourceChanged = !existing || existing.text !== sourceText || existing.source_language !== sourceLanguage;
+                    const hash = sourceChanged ? sourceHash(sourceLanguage, sourceText) : existing.source_hash;
                     const nonEmpty = Number(Boolean(text.trim()));
                     upsertNode.run({
-                        id: raw.id, notebookId, parentId: typeof raw.parentId === 'string' ? raw.parentId : null, text,
+                        id: raw.id, notebookId, parentId: typeof raw.parentId === 'string' ? raw.parentId : null, text: sourceText,
                         x: num(raw.x, 0), y: num(raw.y, 0), type: raw.type === 'image' ? 'image' : 'text',
                         width: num(raw.width, 208), height: num(raw.height, 60),
                         autoWidth: Number(Boolean(raw.autoWidth)), imageUrl: typeof raw.imageUrl === 'string' ? raw.imageUrl : null,
                         preserveAspect: Number(Boolean(raw.preserveAspect)), color: typeof raw.color === 'string' ? raw.color : null,
                         textAlign: raw.textAlign === 'left' || raw.textAlign === 'right' ? raw.textAlign : 'center',
-                        language, hash,
-                        pending: textChanged ? nonEmpty : existing?.translation_pending ?? 0,
-                        auto: textChanged ? nonEmpty : existing?.translation_auto ?? 0,
+                        language: sourceLanguage, hash,
+                        pending: sourceChanged ? nonEmpty : existing?.translation_pending ?? 0,
+                        auto: sourceChanged ? nonEmpty : existing?.translation_auto ?? 0,
                     });
-                    if (textChanged && nonEmpty) upsertTranslation.run(raw.id, language, text, hash, nowIso());
+                    const hasLocalizedText = raw.hasLocalizedText === true;
+                    if (language !== sourceLanguage && !hasLocalizedText) {
+                        deleteTranslation.run(raw.id, language, hash);
+                    } else if (hasLocalizedText && (nonEmpty || !updatesSource)) {
+                        upsertTranslation.run(raw.id, language, text, hash, nowIso());
+                    }
                 }
                 for (const id of removeIds) removeNode.run(id, notebookId);
             })();
