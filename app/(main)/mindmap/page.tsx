@@ -158,7 +158,7 @@ function toSyncPayload(targets: Map<string, MindNode | null>) {
 const DEFAULT_W = 208, DEFAULT_H = 60;
 const MAX_AUTO_NODE_W = 400;
 const LEVEL_GAP_X = 64, SIBLING_GAP = 28, TREE_GAP = 64;
-const MIN_ZOOM = 0.05, MAX_ZOOM = 3, DEFAULT_PAN = { x: 160, y: 180 };
+const MIN_ZOOM = 0.05, MAX_ZOOM = 5, DEFAULT_PAN = { x: 160, y: 180 };
 const NODE_COLORS = ['#FFFFFF', '#FFEFE5', '#E5F4FF', '#EAFCE9', '#F4E5FF', '#FFF0F0'];
 const COLLAPSED_GROUPS_KEY = 'mindmap-collapsed-groups';
 const MINDMAP_SIDEBAR_OPEN_KEY = 'mindmap-sidebar-open';
@@ -1748,7 +1748,15 @@ export default function MindmapPage() {
                 onMouseEnter={() => setBoardActive(true)}
                 onMouseLeave={() => setBoardActive(false)}
             >
-                <div data-canvas-controls className="sticky top-0 z-10 flex items-center gap-2 overflow-x-auto px-4 pt-4 pb-2">
+                <div
+                    data-canvas-controls
+                    className="mindmap-toolbar-scroll sticky top-0 z-10 flex items-center gap-2 overflow-x-auto px-4 pt-4 pb-2"
+                    onWheel={(event) => {
+                        if (!event.shiftKey) return;
+                        event.preventDefault();
+                        event.currentTarget.scrollLeft += event.deltaX || event.deltaY;
+                    }}
+                >
                     <button onClick={() => setIsSidebarOpen(v => !v)} className="flex h-10 w-10 items-center justify-center rounded-xl bg-white border border-[#E4E4ED] shadow-sm text-[#4B4A5C] hover:bg-[#F2F1FA] transition-colors">
                         <PanelLeftIcon />
                     </button>
@@ -1991,6 +1999,16 @@ export default function MindmapPage() {
                                 )}
 
                                 <button onPointerDown={(e) => e.stopPropagation()} onClick={(e) => { e.stopPropagation(); createNode(node.id, '', 'text'); }} className="absolute -right-3 top-1/2 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded-full bg-[#7B61FF] text-white opacity-0 shadow-md transition-opacity duration-150 group-hover:opacity-100 hover:bg-[#6A4FF5]"><PlusIcon /></button>
+                                <button
+                                    type="button"
+                                    onPointerDown={(e) => e.stopPropagation()}
+                                    onClick={(e) => { e.stopPropagation(); createNode(node.parentId, '', 'text'); }}
+                                    aria-label="Add sibling node below"
+                                    title="Add sibling node below"
+                                    className="absolute -bottom-2 left-[30%] z-10 flex h-5 w-5 items-center justify-center rounded-full bg-[#7B61FF] text-white opacity-0 shadow-md transition-opacity duration-150 group-hover:opacity-100 hover:bg-[#6A4FF5] focus-visible:opacity-100"
+                                >
+                                    <PlusIcon />
+                                </button>
                                 {childCount > 0 && (
                                     <button
                                         type="button"

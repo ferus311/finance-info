@@ -65,6 +65,14 @@ type StudyData = {
     notebooks?: NotebookSummary[];
 };
 
+function getReviewKey(card: StudyCard) {
+    return `${card.type}:${card.entry.id}`;
+}
+
+function getSessionKey(deckType: DeckType, language: Language, notebookId: string | null) {
+    return `${deckType}:${language}:${notebookId ?? ""}`;
+}
+
 const ratingOptions: Array<{ value: Rating; label: string }> = [
     { value: "again", label: "Again" },
     { value: "hard", label: "Hard" },
@@ -98,10 +106,26 @@ const FlashcardsPage = () => {
     const [loading, setLoading] = React.useState(true);
     const [loadError, setLoadError] = React.useState("");
     const [revealed, setRevealed] = React.useState(false);
-    const [rating, setRating] = React.useState<Rating | null>(null);
+    const [savingReviews, setSavingReviews] = React.useState(0);
     const [messageApi, contextHolder] = message.useMessage();
+    const selectedSessionKey = getSessionKey(deckType, language, selectedNotebookId);
+    const selectedSessionKeyRef = React.useRef(selectedSessionKey);
+    React.useEffect(() => {
+        selectedSessionKeyRef.current = selectedSessionKey;
+    }, [selectedSessionKey]);
+    const reviewQueue = React.useRef<Promise<void>>(Promise.resolve());
+    const pendingReviewKeys = React.useRef(new Set<string>());
+    const reviewedCardKeys = React.useRef(new Set<string>());
+    const prefetchingSessions = React.useRef(new Set<string>());
+    const prefetchedSessions = React.useRef(new Set<string>());
+    const failedReviews = React.useRef(false);
 
     const refreshSession = React.useCallback(async (showSpinner = true, signal?: AbortSignal) => {
+        const key = getSessionKey(deckType, language, selectedNotebookId);
+        prefetchedSessions.current.delete(key);
+        for (const reviewKey of reviewedCardKeys.current) {
+            if (reviewKey.startsWith(`${key}:`)) reviewedCardKeys.current.delete(reviewKey);
+        }
         if (showSpinner) setLoading(true);
         setLoadError("");
         const params = new URLSearchParams({ deck: deckType });
@@ -146,28 +170,112 @@ const FlashcardsPage = () => {
     const progress = activeSession?.total ? Math.round((studiedCount / activeSession.total) * 100) : 0;
     const isStudying = !loading && !loadError && !!currentCard;
 
+    React.useEffect(() => {
+        if (!activeSession || activeSession.cards.length === 0 || activeSession.cards.length > 5) return;
+
+        const key = getSessionKey(activeSession.deckType, activeSession.language, activeSession.notebookId);
+        if (prefetchingSessions.current.has(key) || prefetchedSessions.current.has(key)) return;
+
+        prefetchingSessions.current.add(key);
+        const params = new URLSearchParams({ deck: activeSession.deckType });
+        if (activeSession.deckType === "vocabulary") params.set("language", activeSession.language);
+        if (activeSession.deckType === "mindmap" && activeSession.notebookId) {
+            params.set("notebookId", activeSession.notebookId);
+        }
+
+        void (async () => {
+            try {
+                await reviewQueue.current;
+                const response = await fetch(`/api/flashcards?${params}`, { cache: "no-store" });
+                const payload = await response.json() as StudyData & { error?: string };
+                if (!response.ok) throw new Error(payload.error || "Could not load upcoming flashcards.");
+
+                setSession((previous) => {
+                    if (!previous || getSessionKey(previous.deckType, previous.language, previous.notebookId) !== key) {
+                        return previous;
+                    }
+
+                    const existingKeys = new Set(previous.cards.map(getReviewKey));
+                    const additionalCards = payload.cards.filter((card) => {
+                        const cardKey = getReviewKey(card);
+                        return !existingKeys.has(cardKey)
+                            && !pendingReviewKeys.current.has(`${key}:${cardKey}`)
+                            && !reviewedCardKeys.current.has(`${key}:${cardKey}`);
+                    });
+                    if (additionalCards.length === 0) {
+                        prefetchedSessions.current.add(key);
+                        return previous;
+                    }
+
+                    prefetchedSessions.current.delete(key);
+                    return { ...previous, cards: [...previous.cards, ...additionalCards] };
+                });
+            } catch (error) {
+                messageApi.error(error instanceof Error ? error.message : "Could not load upcoming flashcards.");
+            } finally {
+                prefetchingSessions.current.delete(key);
+            }
+        })();
+    }, [activeSession, messageApi]);
+
     const submitRating = async (selectedRating: Rating) => {
         if (!currentCard) return;
-        setRating(selectedRating);
-        try {
+
+        const card = currentCard;
+        const sessionKey = getSessionKey(deckType, language, selectedNotebookId);
+        const cardKey = getReviewKey(card);
+        const reviewKey = `${sessionKey}:${cardKey}`;
+        if (pendingReviewKeys.current.has(reviewKey)) return;
+        pendingReviewKeys.current.add(reviewKey);
+
+        setSession((previous) => {
+            if (!previous || getSessionKey(previous.deckType, previous.language, previous.notebookId) !== sessionKey) {
+                return previous;
+            }
+
+            return {
+                ...previous,
+                cards: previous.cards.filter((candidate) => getReviewKey(candidate) !== cardKey),
+                newCount: card.state ? previous.newCount : Math.max(0, previous.newCount - 1),
+                dueCount: card.state ? Math.max(0, previous.dueCount - 1) : previous.dueCount,
+            };
+        });
+        setRevealed(false);
+        setSavingReviews((count) => count + 1);
+
+        const queuedReview = reviewQueue.current.then(async () => {
             const response = await fetch("/api/flashcards", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
-                    targetLanguage: currentCard.type === "mindmap" ? currentCard.entry.language : language,
-                    entryId: currentCard.entry.id,
-                    cardType: currentCard.type,
+                    targetLanguage: card.type === "mindmap" ? card.entry.language : language,
+                    entryId: card.entry.id,
+                    cardType: card.type,
                     rating: selectedRating,
                 }),
             });
             const payload = await response.json() as { error?: string };
             if (!response.ok) throw new Error(payload.error || "Could not save your review.");
-            await refreshSession(false);
-        } catch (error) {
+            reviewedCardKeys.current.add(reviewKey);
+        });
+        const settledReview = queuedReview.catch((error: unknown) => {
+            failedReviews.current = true;
             messageApi.error(error instanceof Error ? error.message : "Could not save your review.");
-        } finally {
-            setRating(null);
-        }
+        });
+        reviewQueue.current = settledReview;
+
+        void settledReview.then(() => {
+            pendingReviewKeys.current.delete(reviewKey);
+            setSavingReviews((count) => Math.max(0, count - 1));
+            if (
+                reviewQueue.current === settledReview
+                && pendingReviewKeys.current.size === 0
+                && failedReviews.current
+            ) {
+                failedReviews.current = false;
+                if (selectedSessionKeyRef.current === sessionKey) void refreshSession(false);
+            }
+        });
     };
 
     const switchLanguage = (value: string | number) => {
@@ -205,6 +313,7 @@ const FlashcardsPage = () => {
                     <Typography.Text type="secondary" className="text-xs">
                         {activeSession ? `${activeSession.dueCount} due · ${activeSession.newCount} new · ${activeSession.total} cards` : "Loading deck"}
                     </Typography.Text>
+                    {savingReviews > 0 && <Typography.Text type="secondary" className="text-xs">Saving {savingReviews} review{savingReviews === 1 ? "" : "s"}…</Typography.Text>}
                     <Button size={isStudying ? "small" : "middle"} icon={<ReloadOutlined />} onClick={() => void refreshSession()}>Refresh</Button>
                     {deckType === "vocabulary" && <Button size={isStudying ? "small" : "middle"} type="link" href="/vocabulary" icon={<SwapOutlined />}>Vocabulary list</Button>}
                 </Space>
@@ -395,8 +504,6 @@ const FlashcardsPage = () => {
                                         danger={option.value === "again"}
                                         type={option.value === "good" ? "primary" : "default"}
                                         icon={option.value === "again" ? <CloseOutlined /> : <CheckOutlined />}
-                                        loading={rating === option.value}
-                                        disabled={rating !== null}
                                         onClick={() => void submitRating(option.value)}
                                         size="small"
                                         className="!flex h-auto min-h-11 w-full min-w-0 items-center justify-center whitespace-normal rounded-md px-2 py-1.5 text-xs"

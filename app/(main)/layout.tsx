@@ -200,7 +200,7 @@ const MainLayout: React.FC<MainLayoutProps> = ({ children }) => {
                     className="app-top-nav"
                 />
 
-                <Button type="text" onClick={() => void logout()} style={{ marginRight: 12 }}>Đăng xuất</Button>
+                <Button type="text" onClick={() => void logout()} style={{ marginRight: 12 }}>Logout</Button>
             </Header>
 
             <Layout className="app-main-body">

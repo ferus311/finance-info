@@ -9,6 +9,7 @@ module.exports = {
     allowedDevOrigins: [
         '100.116.206.87', // IP từ mạng ảo/VPN
         '192.168.1.6',    // IP Wi-Fi nội bộ
+        '192.168.1.4',    // IP Wi-Fi nội bộ
         'localhost',      // Truy cập tại máy local
         '127.0.0.1',       // Loopback IP
         'ferser.tail42fc1b.ts.net'

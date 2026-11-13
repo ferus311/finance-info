@@ -42,8 +42,3 @@
         "node_modules"
     ]
 }
-//how to add allowedDevOrigins to tsconfig.json
-//To add `allowedDevOrigins` to your `tsconfig.json`, you can include it as a custom property in the `compilerOptions` section. However, please note that `allowedDevOrigins` is not a standard TypeScript compiler option, so it won't be recognized by the TypeScript compiler itself. If you're using it for a specific tool or framework that reads this configuration, you can add it like this:
-
-
-
